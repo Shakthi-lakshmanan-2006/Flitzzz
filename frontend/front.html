@@ -1,0 +1,338 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>FLITZZ Operations</title>
+
+    <style>
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            margin: 0;
+            font-family: Arial, sans-serif;
+            background: #f4f6f8;
+            color: #1f2937;
+        }
+
+        header {
+            background: #111827;
+            color: white;
+            padding: 20px 40px;
+        }
+
+        header h1 {
+            margin: 0;
+        }
+
+        header p {
+            margin: 5px 0 0;
+            color: #d1d5db;
+        }
+
+        .container {
+            max-width: 1300px;
+            margin: 30px auto;
+            padding: 0 20px;
+        }
+
+        .stats {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            margin-bottom: 25px;
+        }
+
+        .card {
+            background: white;
+            padding: 20px;
+            border-radius: 10px;
+            box-shadow: 0 2px 8px rgba(0, 0, 0, 0.06);
+        }
+
+        .stat-number {
+            font-size: 28px;
+            font-weight: bold;
+            margin-top: 10px;
+        }
+
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            background: white;
+        }
+
+        th,
+        td {
+            padding: 14px;
+            border-bottom: 1px solid #e5e7eb;
+            text-align: left;
+        }
+
+        th {
+            background: #f9fafb;
+        }
+
+        button {
+            border: none;
+            padding: 9px 14px;
+            border-radius: 6px;
+            cursor: pointer;
+            background: #2563eb;
+            color: white;
+        }
+
+        button:hover {
+            opacity: 0.9;
+        }
+
+        .HIGH {
+            color: #dc2626;
+            font-weight: bold;
+        }
+
+        .MEDIUM {
+            color: #d97706;
+            font-weight: bold;
+        }
+
+        .LOW {
+            color: #16a34a;
+            font-weight: bold;
+        }
+
+        #message {
+            margin-bottom: 20px;
+            padding: 15px;
+            display: none;
+            background: white;
+            border-radius: 8px;
+        }
+    </style>
+</head>
+
+<body>
+
+    <header>
+        <h1>FLITZZ</h1>
+        <p>Airline Disruption Management Dashboard</p>
+    </header>
+
+    <div class="container">
+
+        <div class="stats">
+
+            <div class="card">
+                Passengers
+                <div class="stat-number" id="passengerCount">-</div>
+            </div>
+
+            <div class="card">
+                High Risk
+                <div class="stat-number" id="highCount">-</div>
+            </div>
+
+            <div class="card">
+                Medium Risk
+                <div class="stat-number" id="mediumCount">-</div>
+            </div>
+
+            <div class="card">
+                Low Risk
+                <div class="stat-number" id="lowCount">-</div>
+            </div>
+
+        </div>
+
+        <div id="message"></div>
+
+        <div class="card">
+
+            <h2>Passenger Flights</h2>
+
+            <table>
+
+                <thead>
+                    <tr>
+                        <th>Passenger</th>
+                        <th>Booking</th>
+                        <th>Flight</th>
+                        <th>Route</th>
+                        <th>Cabin</th>
+                        <th>Seat</th>
+                        <th>Prediction</th>
+                        <th>Action</th>
+                    </tr>
+                </thead>
+
+                <tbody id="flightTable">
+                </tbody>
+
+            </table>
+
+        </div>
+
+    </div>
+
+    <script>
+
+        const API = "http://127.0.0.1:8000";
+
+
+        async function loadFlights() {
+
+            const response =
+                await fetch(`${API}/api/passenger-flights`);
+
+            const data =
+                await response.json();
+
+            const table =
+                document.getElementById("flightTable");
+
+            table.innerHTML = "";
+
+            let high = 0;
+            let medium = 0;
+            let low = 0;
+
+            data.forEach(item => {
+
+                let prediction = "Not predicted";
+
+                if (item.risk_level) {
+
+                    prediction =
+                        `<span class="${item.risk_level}">
+                    ${item.risk_level}
+                 </span>`;
+
+                    if (item.risk_level === "HIGH") high++;
+                    if (item.risk_level === "MEDIUM") medium++;
+                    if (item.risk_level === "LOW") low++;
+                }
+
+                table.innerHTML += `
+
+            <tr>
+
+                <td>
+                    ${item.passenger_name}
+                </td>
+
+                <td>
+                    ${item.booking_reference}
+                </td>
+
+                <td>
+                    ${item.flight_number}
+                </td>
+
+                <td>
+                    ${item.route}
+                </td>
+
+                <td>
+                    ${item.cabin_class}
+                </td>
+
+                <td>
+                    ${item.seat_number}
+                </td>
+
+                <td>
+                    ${prediction}
+                </td>
+
+                <td>
+
+                    <button
+                        onclick="predictFlight(${item.flight_id})">
+
+                        Predict
+
+                    </button>
+
+                </td>
+
+            </tr>
+        `;
+            });
+
+            document.getElementById("passengerCount")
+                .innerText = data.length;
+
+            document.getElementById("highCount")
+                .innerText = high;
+
+            document.getElementById("mediumCount")
+                .innerText = medium;
+
+            document.getElementById("lowCount")
+                .innerText = low;
+        }
+
+
+        async function predictFlight(flightId) {
+
+            showMessage("Running prediction...");
+
+            try {
+
+                const response =
+                    await fetch(
+                        `${API}/api/flights/${flightId}/predict`,
+                        {
+                            method: "POST"
+                        }
+                    );
+
+                const result =
+                    await response.json();
+
+                if (!response.ok) {
+                    throw new Error(
+                        result.detail || "Prediction failed"
+                    );
+                }
+
+                showMessage(
+                    `Flight ${result.flight_number}:
+             ${result.risk_level} risk |
+             Probability:
+             ${(result.delay_probability * 100).toFixed(1)}%`
+                );
+
+                await loadFlights();
+
+            }
+            catch (error) {
+
+                showMessage(
+                    "Error: " + error.message
+                );
+            }
+        }
+
+
+        function showMessage(text) {
+
+            const message =
+                document.getElementById("message");
+
+            message.style.display = "block";
+            message.innerText = text;
+        }
+
+
+        loadFlights();
+
+    </script>
+
+</body>
+
+</html>
