@@ -1,0 +1,153 @@
+{
+  "project": "FLITZZ",
+  "training_type": "chronological_80_20_chunk_training",
+  "weather_used": false,
+  "validation_used": false,
+  "models": {
+    "classification": "XGBoost",
+    "regression": "LightGBM"
+  },
+  "features": {
+    "xgboost_count": 24,
+    "lightgbm_count": 34,
+    "xgboost": [
+      "airline",
+      "origin_airport",
+      "destination_airport",
+      "departure_hour",
+      "departure_period",
+      "day_of_week",
+      "month",
+      "season",
+      "distance_miles",
+      "route_average_delay_minutes",
+      "route_delay_rate",
+      "route_previous_flights",
+      "route_previous_delays",
+      "airline_average_delay_minutes",
+      "airline_delay_rate",
+      "airline_previous_flights",
+      "airline_previous_delays",
+      "route_flights_1h",
+      "route_flights_3h",
+      "origin_flights_1h",
+      "destination_flights_1h",
+      "route_congestion_ratio",
+      "origin_congestion_ratio",
+      "destination_congestion_ratio"
+    ],
+    "lightgbm": [
+      "airline",
+      "origin_airport",
+      "destination_airport",
+      "departure_hour",
+      "departure_period",
+      "day_of_week",
+      "month",
+      "season",
+      "distance_miles",
+      "route_average_delay_minutes",
+      "route_delay_rate",
+      "route_previous_flights",
+      "route_previous_delays",
+      "airline_average_delay_minutes",
+      "airline_delay_rate",
+      "airline_previous_flights",
+      "airline_previous_delays",
+      "route_flights_1h",
+      "route_flights_3h",
+      "origin_flights_1h",
+      "destination_flights_1h",
+      "route_congestion_ratio",
+      "origin_congestion_ratio",
+      "destination_congestion_ratio",
+      "scheduled_time",
+      "scheduled_speed",
+      "departure_minute_of_day",
+      "day",
+      "airline_hist_delay",
+      "origin_airport_hist_delay",
+      "destination_airport_hist_delay",
+      "route_hist_delay",
+      "departure_delay",
+      "taxi_out"
+    ]
+  },
+  "split": {
+    "train_ratio": 0.8,
+    "test_ratio": 0.2,
+    "train_rows": 4571206,
+    "test_rows": 1142802,
+    "train_segments": 92,
+    "test_segments": 24
+  },
+  "targets": {
+    "classification": "delayed_15",
+    "regression": "arrival_delay_minutes"
+  },
+  "classification_threshold": 0.5,
+  "decision_policy": {
+    "normal_wait": "<15 minutes",
+    "manual_action": "15-29 minutes",
+    "automatic_action": ">=30 minutes"
+  },
+  "metrics": {
+    "split": {
+      "total_rows": 5714008,
+      "train_rows": 4571206,
+      "test_rows": 1142802,
+      "train_ratio": 0.7999999299965979,
+      "test_ratio": 0.20000007000340217
+    },
+    "classification": {
+      "accuracy": 0.8409427004852984,
+      "precision": 0.534032017792325,
+      "recall": 0.5227808387292231,
+      "f1_score": 0.5283465363747467,
+      "roc_auc": 0.8416058871481304,
+      "threshold": 0.5,
+      "confusion_matrix": [
+        [
+          859221,
+          88834
+        ],
+        [
+          92937,
+          101810
+        ]
+      ],
+      "classification_report": {
+        "0": {
+          "precision": 0.9023933002715936,
+          "recall": 0.9062986852028627,
+          "f1-score": 0.9043417764219064,
+          "support": 948055.0
+        },
+        "1": {
+          "precision": 0.534032017792325,
+          "recall": 0.5227808387292231,
+          "f1-score": 0.5283465363747467,
+          "support": 194747.0
+        },
+        "accuracy": 0.8409427004852984,
+        "macro avg": {
+          "precision": 0.7182126590319593,
+          "recall": 0.714539761966043,
+          "f1-score": 0.7163441563983266,
+          "support": 1142802.0
+        },
+        "weighted avg": {
+          "precision": 0.8396201736241165,
+          "recall": 0.8409427004852984,
+          "f1-score": 0.8402677329625282,
+          "support": 1142802.0
+        }
+      }
+    },
+    "regression": {
+      "mae_minutes": 12.78994492854292,
+      "rmse_minutes": 32.299129987917844,
+      "r2": 0.21567921574293525
+    }
+  }
+}

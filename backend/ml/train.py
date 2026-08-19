@@ -1,58 +1,50 @@
 """
-FLITZZ
-======
+FLITZZ - OFFLINE MODEL TRAINING
 
-Flight Delay Prediction ML Training Pipeline
+DUAL MODEL ARCHITECTURE
+-----------------------
+XGBoost
+    -> classification
+    -> probability that arrival delay >= 15 minutes
+    -> uses XGB_FEATURES from features.py
 
-Models:
-    1. CatBoost
-    2. LightGBM
-    3. CatBoost + LightGBM weighted ensemble
+LightGBM
+    -> regression
+    -> approximate arrival delay in minutes
+    -> uses LGBM_FEATURES from features.py
 
-Data source:
-    PostgreSQL -> feature_builder.py -> pandas DataFrame
+DATA
+----
+datasets/feature_dataset.parquet
 
-NO CSV IS REQUIRED.
+SPLIT
+-----
+Chronological 80% train / 20% test.
+No validation split.
 
-Pipeline:
-    PostgreSQL
-        ↓
-    feature_builder.py
-        ↓
-    Feature DataFrame
-        ↓
-    Chronological split
-        ↓
-    CatBoost + LightGBM
-        ↓
-    Ensemble
-        ↓
-    Evaluation
-        ↓
-    .pkl models
+IMPORTANT
+---------
+Weather is not used.
 
-Metrics:
-    Accuracy
-    Precision
-    Recall
-    F1
-    ROC-AUC
-    Confusion Matrix
+XGBoost and LightGBM do NOT receive the same feature dataframe:
+    XGBoost  -> 24-feature contract
+    LightGBM -> 34-feature contract
+
+This keeps the model inputs consistent with the updated features.py.
 """
 
 from __future__ import annotations
 
-import os
 import json
-import joblib
-import warnings
+import pickle
+import sys
+import time
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-from catboost import CatBoostClassifier
-from lightgbm import LGBMClassifier
-
+from sklearn.preprocessing import OrdinalEncoder
 from sklearn.metrics import (
     accuracy_score,
     precision_score,
@@ -61,1754 +53,1317 @@ from sklearn.metrics import (
     roc_auc_score,
     confusion_matrix,
     classification_report,
+    mean_absolute_error,
+    mean_squared_error,
+    r2_score,
 )
 
-# ------------------------------------------------------------
-# IMPORTANT
-# ------------------------------------------------------------
-# feature_builder.py must be in the same directory.
-#
-# backend/
-#   ml/
-#       train.py
-#       feature_builder.py
-#
-# ------------------------------------------------------------
-
-from feature_builder import build_features
+from xgboost import XGBClassifier
+from lightgbm import LGBMRegressor
 
 
-warnings.filterwarnings("ignore")
+# ============================================================================
+# PATHS
+# ============================================================================
+
+BASE_DIR = Path(__file__).resolve().parent
+
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
+DATASET_FILE = BASE_DIR / "datasets" / "feature_dataset.parquet"
+MODEL_DIR = BASE_DIR / "models"
+ARTIFACT_DIR = BASE_DIR / "artifacts"
+
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ============================================================
+# ============================================================================
+# FEATURES
+# ============================================================================
+
+from features import (
+    MODEL_FEATURES,
+    XGB_FEATURES,
+    LGBM_FEATURES,
+    TARGET_CLASSIFICATION,
+    TARGET_REGRESSION,
+    CATEGORICAL_FEATURES,
+)
+
+
+# ============================================================================
 # CONFIGURATION
-# ============================================================
+# ============================================================================
 
-MODEL_DIR = "models"
+MAX_ROWS = None
 
-TARGET = "delayed_15"
-
-ID_COLUMN = "flight_id"
-
-DATE_COLUMN = "flight_date"
-
+TEST_SIZE = 0.20
 RANDOM_STATE = 42
 
+# XGBoost
+XGB_TREES = 300
+XGB_LEARNING_RATE = 0.05
+XGB_MAX_DEPTH = 6
+XGB_MIN_CHILD_WEIGHT = 3
+XGB_SUBSAMPLE = 0.85
+XGB_COLSAMPLE = 0.85
+XGB_REG_ALPHA = 0.05
+XGB_REG_LAMBDA = 1.0
 
-# ============================================================
-# ENSEMBLE CONFIGURATION
-# ============================================================
+# LightGBM
+LGB_TREES = 400
+LGB_LEARNING_RATE = 0.05
+LGB_NUM_LEAVES = 31
+LGB_MAX_DEPTH = -1
+LGB_MIN_CHILD_SAMPLES = 30
+LGB_SUBSAMPLE = 0.85
+LGB_COLSAMPLE = 0.85
 
-CATBOOST_WEIGHT = 0.50
-
-LIGHTGBM_WEIGHT = 0.50
-
-PREDICTION_THRESHOLD = 0.50
-
-
-# ============================================================
-# TIME-BASED SPLIT
-# ============================================================
-
-TRAIN_RATIO = 0.70
-
-VALIDATION_RATIO = 0.15
-
-TEST_RATIO = 0.15
-
-
-# ============================================================
-# FEATURE COLUMNS
-# ============================================================
-
-FEATURE_COLUMNS = [
-
-    # ========================================================
-    # 1. FLIGHT / SCHEDULE
-    # ========================================================
-
-    "airline_id",
-
-    "aircraft_id",
-
-    "origin_airport_id",
-
-    "destination_airport_id",
-
-    "departure_hour",
-
-    "day_of_week",
-
-    "month",
-
-    "scheduled_time_minutes",
-
-    "distance_miles",
+# Operational classification threshold.
+# Keep this configurable because 0.50 is the neutral probability threshold.
+CLASSIFICATION_THRESHOLD = 0.50
 
 
-    # ========================================================
-    # 2. HISTORICAL DELAY
-    # ========================================================
+# ============================================================================
+# HELPERS
+# ============================================================================
 
-    "airline_delay_rate",
+def normalize_categorical_columns(
+    frame: pd.DataFrame,
+    columns: list[str],
+) -> pd.DataFrame:
+    """Return a copy with categorical values normalized to strings."""
 
-    "airline_average_delay",
+    result = frame.copy()
 
-    "route_delay_rate",
+    for column in columns:
+        if column not in result.columns:
+            raise RuntimeError(
+                f"Required categorical feature missing: {column}"
+            )
 
-    "route_average_delay",
+        result[column] = (
+            result[column]
+            .fillna("UNKNOWN")
+            .astype(str)
+        )
 
-    "flight_number_delay_rate",
-
-    "flight_number_average_delay",
-
-
-    # ========================================================
-    # 3. CONGESTION
-    # ========================================================
-
-    "origin_flights_1h",
-
-    "destination_flights_1h",
-
-    "route_flights_1h",
-
-    "origin_congestion_ratio",
-
-    "destination_congestion_ratio",
-
-    "route_congestion_ratio",
-
-    "origin_congestion_level",
-
-    "destination_congestion_level",
-
-    "route_congestion_level",
+    return result
 
 
-    # ========================================================
-    # 4. HISTORICAL WEATHER
-    # ========================================================
+def validate_feature_contracts(df: pd.DataFrame) -> None:
+    """Validate the feature contracts imported from features.py."""
 
-    "origin_temperature",
+    print()
+    print("=" * 70)
+    print("FEATURE CONTRACT VALIDATION")
+    print("=" * 70)
 
-    "origin_precipitation",
+    print(f"[INFO] Master features : {len(MODEL_FEATURES)}")
+    print(f"[INFO] XGBoost features: {len(XGB_FEATURES)}")
+    print(f"[INFO] LightGBM features: {len(LGBM_FEATURES)}")
 
-    "origin_wind_speed",
+    if len(XGB_FEATURES) != 24:
+        raise RuntimeError(
+            f"XGBoost must use exactly 24 features. "
+            f"Got {len(XGB_FEATURES)}."
+        )
 
-    "origin_visibility",
+    if len(LGBM_FEATURES) != 34:
+        raise RuntimeError(
+            f"LightGBM must use exactly 34 features. "
+            f"Got {len(LGBM_FEATURES)}."
+        )
 
-    "origin_weather_code",
+    if len(set(XGB_FEATURES)) != len(XGB_FEATURES):
+        raise RuntimeError("Duplicate XGBoost feature detected.")
 
-    "destination_temperature",
+    if len(set(LGBM_FEATURES)) != len(LGBM_FEATURES):
+        raise RuntimeError("Duplicate LightGBM feature detected.")
 
-    "destination_precipitation",
+    if not set(XGB_FEATURES).issubset(set(MODEL_FEATURES)):
+        missing = sorted(set(XGB_FEATURES) - set(MODEL_FEATURES))
+        raise RuntimeError(
+            "XGBoost features missing from master feature set: "
+            + ", ".join(missing)
+        )
 
-    "destination_wind_speed",
+    if not set(LGBM_FEATURES).issubset(set(MODEL_FEATURES)):
+        missing = sorted(set(LGBM_FEATURES) - set(MODEL_FEATURES))
+        raise RuntimeError(
+            "LightGBM features missing from master feature set: "
+            + ", ".join(missing)
+        )
 
-    "destination_visibility",
+    missing_xgb = [c for c in XGB_FEATURES if c not in df.columns]
+    missing_lgb = [c for c in LGBM_FEATURES if c not in df.columns]
 
-    "destination_weather_code",
+    if missing_xgb:
+        raise RuntimeError(
+            "Dataset missing XGBoost features:\n"
+            + "\n".join(f"  - {c}" for c in missing_xgb)
+        )
 
-    "weather_severity",
-]
+    if missing_lgb:
+        raise RuntimeError(
+            "Dataset missing LightGBM features:\n"
+            + "\n".join(f"  - {c}" for c in missing_lgb)
+        )
+
+    # Explicit weather guard.
+    weather_terms = (
+        "weather",
+        "temperature",
+        "humidity",
+        "wind",
+        "precipitation",
+        "visibility",
+        "pressure",
+        "rain",
+        "snow",
+        "cloud",
+    )
+
+    weather_features = [
+        c
+        for c in set(XGB_FEATURES + LGBM_FEATURES)
+        if any(term in c.lower() for term in weather_terms)
+    ]
+
+    if weather_features:
+        raise RuntimeError(
+            "Weather-related model features detected: "
+            + ", ".join(sorted(weather_features))
+        )
+
+    print("[OK] XGBoost = 24 features")
+    print("[OK] LightGBM = 34 features")
+    print("[OK] Weather = removed")
+    print("[OK] Feature contracts are valid.")
 
 
-# ============================================================
-# CREATE MODEL DIRECTORY
-# ============================================================
-
-os.makedirs(
-    MODEL_DIR,
-    exist_ok=True
-)
-
-
-# ============================================================
-# LOAD DATA FROM POSTGRESQL
-# ============================================================
+# ============================================================================
+# DATA LOADING
+# ============================================================================
 
 def load_dataset() -> pd.DataFrame:
+    """Load the development parquet dataset."""
 
     print()
     print("=" * 70)
-    print("BUILDING FEATURE DATASET FROM POSTGRESQL")
+    print("LOADING FEATURE DATASET")
     print("=" * 70)
 
-    print()
-    print("[INFO] PostgreSQL is the primary data source.")
+    print(f"[INFO] Dataset: {DATASET_FILE}")
 
-    print(
-        "[INFO] Calling feature_builder.build_features()..."
-    )
-
-    # --------------------------------------------------------
-    # feature_builder:
-    #
-    # PostgreSQL
-    #     ↓
-    # flights
-    #     ↓
-    # historical delay
-    #     ↓
-    # congestion
-    #     ↓
-    # airports
-    #     ↓
-    # Open-Meteo historical weather
-    # --------------------------------------------------------
-
-    df = build_features(
-        use_weather=True
-    )
-
-    if df is None:
-
-        raise RuntimeError(
-            "feature_builder.build_features() returned None."
+    if not DATASET_FILE.exists():
+        raise FileNotFoundError(
+            "\nFeature dataset was not found.\n\n"
+            f"Expected:\n{DATASET_FILE}\n\n"
+            "Run:\n"
+            "    python build_dataset.py\n"
+            "first."
         )
 
-    if df.empty:
-
-        raise RuntimeError(
-            "Feature builder returned an empty dataset."
-        )
-
-    print()
-
-    print(
-        f"[OK] Feature rows generated: "
-        f"{len(df):,}"
+    df = pd.read_parquet(
+        DATASET_FILE,
+        engine="pyarrow",
     )
 
-    print(
-        f"[OK] Dataset columns: "
-        f"{len(df.columns)}"
-    )
+    print(f"[OK] Loaded {len(df):,} rows")
+    print(f"[OK] Loaded {len(df.columns):,} columns")
 
-    # --------------------------------------------------------
-    # Check required columns
-    # --------------------------------------------------------
+    if MAX_ROWS is not None and len(df) > MAX_ROWS:
+        df = df.head(MAX_ROWS).copy()
+        print(f"[INFO] MAX_ROWS applied: {MAX_ROWS:,}")
 
-    required_columns = (
-
-        [
-            ID_COLUMN,
-            DATE_COLUMN
-        ]
-
-        +
-
-        FEATURE_COLUMNS
-
-        +
-
-        [
-            TARGET
-        ]
-    )
-
-    missing_columns = [
-
-        column
-
-        for column in required_columns
-
-        if column not in df.columns
-    ]
-
-    if missing_columns:
-
-        raise ValueError(
-            "\nMissing required columns "
-            "from feature builder:\n\n"
-            +
-            "\n".join(
-                missing_columns
-            )
-        )
-
-    print(
-        "[OK] All required columns are present."
-    )
+    print(f"[OK] Final dataset size: {len(df):,} rows")
 
     return df
 
 
-# ============================================================
-# PREPARE DATA
-# ============================================================
+# ============================================================================
+# TARGET VALIDATION
+# ============================================================================
 
-def prepare_data(
-    df: pd.DataFrame
-) -> pd.DataFrame:
+def prepare_targets(df: pd.DataFrame) -> pd.DataFrame:
+    """Validate and normalize both targets."""
 
     print()
     print("=" * 70)
-    print("PREPARING DATA")
+    print("VALIDATING TARGETS")
     print("=" * 70)
 
-    df = df.copy()
-
-    # --------------------------------------------------------
-    # Flight date
-    # --------------------------------------------------------
-
-    df[DATE_COLUMN] = pd.to_datetime(
-        df[DATE_COLUMN],
-        errors="coerce"
-    )
-
-    invalid_dates = df[
-        DATE_COLUMN
-    ].isna().sum()
-
-    if invalid_dates > 0:
-
-        print(
-            f"[WARNING] Removing "
-            f"{invalid_dates:,} rows with invalid dates."
-        )
-
-        df = df[
-            df[DATE_COLUMN].notna()
-        ]
-
-    # --------------------------------------------------------
-    # Target
-    # --------------------------------------------------------
-
-    df[TARGET] = pd.to_numeric(
-        df[TARGET],
-        errors="coerce"
-    )
-
-    df = df[
-        df[TARGET].notna()
+    required = [
+        TARGET_CLASSIFICATION,
+        TARGET_REGRESSION,
     ]
 
-    df[TARGET] = df[
-        TARGET
-    ].astype(int)
+    missing = [c for c in required if c not in df.columns]
 
-    # --------------------------------------------------------
-    # Make sure target is binary
-    # --------------------------------------------------------
-
-    invalid_target = ~df[
-        TARGET
-    ].isin([0, 1])
-
-    if invalid_target.any():
-
-        print(
-            "[WARNING] Removing rows "
-            "with invalid target values."
-        )
-
-        df = df[
-            ~invalid_target
-        ]
-
-    # --------------------------------------------------------
-    # Numeric feature conversion
-    # --------------------------------------------------------
-
-    for column in FEATURE_COLUMNS:
-
-        df[column] = pd.to_numeric(
-            df[column],
-            errors="coerce"
-        )
-
-    # --------------------------------------------------------
-    # Replace infinity
-    # --------------------------------------------------------
-
-    df[
-        FEATURE_COLUMNS
-    ] = df[
-        FEATURE_COLUMNS
-    ].replace(
-        [
-            np.inf,
-            -np.inf
-        ],
-        np.nan
-    )
-
-    # --------------------------------------------------------
-    # Sort chronologically
-    #
-    # This is extremely important.
-    #
-    # Older flights -> training
-    # Later flights -> validation/test
-    # --------------------------------------------------------
-
-    df = df.sort_values(
-        [
-            DATE_COLUMN,
-            ID_COLUMN
-        ]
-    )
-
-    df = df.reset_index(
-        drop=True
-    )
-
-    print(
-        f"[OK] Prepared rows: "
-        f"{len(df):,}"
-    )
-
-    print()
-
-    print(
-        "[INFO] Date range:"
-    )
-
-    print(
-        f"       {df[DATE_COLUMN].min()}"
-    )
-
-    print(
-        f"       {df[DATE_COLUMN].max()}"
-    )
-
-    print()
-
-    print(
-        "[INFO] Target distribution:"
-    )
-
-    target_distribution = (
-        df[TARGET]
-        .value_counts(
-            normalize=True
-        )
-        .sort_index()
-    )
-
-    for value, percentage in (
-        target_distribution.items()
-    ):
-
-        label = (
-            "ON-TIME"
-            if value == 0
-            else "DELAYED"
-        )
-
-        print(
-            f"       {label} ({value}) : "
-            f"{percentage * 100:.2f}%"
-        )
-
-    return df
-
-
-# ============================================================
-# TIME-BASED SPLIT
-# ============================================================
-
-def time_split(
-    df: pd.DataFrame
-):
-
-    print()
-    print("=" * 70)
-    print("CHRONOLOGICAL TIME-BASED SPLIT")
-    print("=" * 70)
-
-    if abs(
-        TRAIN_RATIO
-        +
-        VALIDATION_RATIO
-        +
-        TEST_RATIO
-        - 1.0
-    ) > 0.001:
-
-        raise ValueError(
-            "Train + Validation + Test "
-            "ratios must equal 1.0"
-        )
-
-    n = len(df)
-
-    train_end = int(
-        n * TRAIN_RATIO
-    )
-
-    validation_end = int(
-        n *
-        (
-            TRAIN_RATIO
-            +
-            VALIDATION_RATIO
-        )
-    )
-
-    train_df = df.iloc[
-        :train_end
-    ].copy()
-
-    validation_df = df.iloc[
-        train_end:validation_end
-    ].copy()
-
-    test_df = df.iloc[
-        validation_end:
-    ].copy()
-
-    # --------------------------------------------------------
-    # Print split information
-    # --------------------------------------------------------
-
-    print()
-
-    print(
-        f"Train      : "
-        f"{len(train_df):,} rows"
-    )
-
-    print(
-        f"Validation : "
-        f"{len(validation_df):,} rows"
-    )
-
-    print(
-        f"Test       : "
-        f"{len(test_df):,} rows"
-    )
-
-    print()
-
-    print(
-        "Train dates:"
-    )
-
-    print(
-        f"    {train_df[DATE_COLUMN].min()}"
-        f" → "
-        f"{train_df[DATE_COLUMN].max()}"
-    )
-
-    print()
-
-    print(
-        "Validation dates:"
-    )
-
-    print(
-        f"    {validation_df[DATE_COLUMN].min()}"
-        f" → "
-        f"{validation_df[DATE_COLUMN].max()}"
-    )
-
-    print()
-
-    print(
-        "Test dates:"
-    )
-
-    print(
-        f"    {test_df[DATE_COLUMN].min()}"
-        f" → "
-        f"{test_df[DATE_COLUMN].max()}"
-    )
-
-    # --------------------------------------------------------
-    # Safety check
-    # --------------------------------------------------------
-
-    if (
-        train_df[DATE_COLUMN].max()
-        >=
-        validation_df[DATE_COLUMN].min()
-    ):
-
+    if missing:
         raise RuntimeError(
-            "Temporal split error: "
-            "training overlaps validation."
+            "Missing target columns:\n"
+            + "\n".join(f"  - {c}" for c in missing)
         )
 
-    if (
-        validation_df[DATE_COLUMN].max()
-        >=
-        test_df[DATE_COLUMN].min()
-    ):
+    result = df.copy()
 
+    result[TARGET_CLASSIFICATION] = pd.to_numeric(
+        result[TARGET_CLASSIFICATION],
+        errors="coerce",
+    )
+
+    result[TARGET_REGRESSION] = pd.to_numeric(
+        result[TARGET_REGRESSION],
+        errors="coerce",
+    )
+
+    result = result[
+        result[TARGET_CLASSIFICATION].isin([0, 1])
+    ].copy()
+
+    result = result[
+        result[TARGET_REGRESSION].notna()
+    ].copy()
+
+    result[TARGET_REGRESSION] = (
+        result[TARGET_REGRESSION]
+        .clip(lower=0)
+    )
+
+    result[TARGET_CLASSIFICATION] = (
+        result[TARGET_CLASSIFICATION]
+        .astype(np.int8)
+    )
+
+    print(f"[OK] Usable rows: {len(result):,}")
+    print(
+        "[INFO] Delayed >=15 minutes: "
+        f"{result[TARGET_CLASSIFICATION].mean() * 100:.2f}%"
+    )
+    print(
+        "[INFO] Average actual delay: "
+        f"{result[TARGET_REGRESSION].mean():.2f} minutes"
+    )
+    print(
+        "[INFO] Maximum actual delay: "
+        f"{result[TARGET_REGRESSION].max():.2f} minutes"
+    )
+
+    return result
+
+
+# ============================================================================
+# CHRONOLOGICAL 80/20 SPLIT
+# ============================================================================
+
+def chronological_split(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Sort chronologically and split 80% train / 20% test."""
+
+    print()
+    print("=" * 70)
+    print("CHRONOLOGICAL 80/20 TRAIN / TEST SPLIT")
+    print("=" * 70)
+
+    if "flight_datetime" not in df.columns:
         raise RuntimeError(
-            "Temporal split error: "
-            "validation overlaps test."
+            "flight_datetime is required for chronological splitting."
         )
 
-    print()
+    result = df.copy()
 
-    print(
-        "[OK] No chronological overlap."
+    result["flight_datetime"] = pd.to_datetime(
+        result["flight_datetime"],
+        errors="coerce",
+        utc=True,
     )
 
-    return (
-        train_df,
-        validation_df,
-        test_df
-    )
-
-
-# ============================================================
-# X / Y
-# ============================================================
-
-def xy_split(
-    df: pd.DataFrame
-):
-
-    X = df[
-        FEATURE_COLUMNS
+    result = result[
+        result["flight_datetime"].notna()
     ].copy()
 
-    y = df[
-        TARGET
-    ].copy()
+    sort_columns = ["flight_datetime"]
 
-    return X, y
+    if "flight_id" in result.columns:
+        sort_columns.append("flight_id")
 
-
-# ============================================================
-# CATBOOST
-# ============================================================
-
-def train_catboost(
-    X_train,
-    y_train,
-    X_validation,
-    y_validation
-):
-
-    print()
-    print("=" * 70)
-    print("TRAINING CATBOOST")
-    print("=" * 70)
-
-    model = CatBoostClassifier(
-
-        iterations=600,
-
-        depth=8,
-
-        learning_rate=0.05,
-
-        loss_function="Logloss",
-
-        eval_metric="AUC",
-
-        random_seed=RANDOM_STATE,
-
-        verbose=100,
-
-        allow_writing_files=False,
-
-        l2_leaf_reg=5,
-
-        random_strength=1,
-
-        auto_class_weights="Balanced"
-    )
-
-    model.fit(
-
-        X_train,
-
-        y_train,
-
-        eval_set=(
-            X_validation,
-            y_validation
-        ),
-
-        early_stopping_rounds=80
-    )
-
-    print()
-
-    print(
-        "[OK] CatBoost training complete."
-    )
-
-    print(
-        f"[INFO] Best iteration: "
-        f"{model.get_best_iteration()}"
-    )
-
-    return model
-
-
-# ============================================================
-# LIGHTGBM
-# ============================================================
-
-def train_lightgbm(
-    X_train,
-    y_train,
-    X_validation,
-    y_validation
-):
-
-    print()
-    print("=" * 70)
-    print("TRAINING LIGHTGBM")
-    print("=" * 70)
-
-    model = LGBMClassifier(
-
-        n_estimators=600,
-
-        learning_rate=0.05,
-
-        num_leaves=31,
-
-        max_depth=-1,
-
-        min_child_samples=30,
-
-        subsample=0.8,
-
-        colsample_bytree=0.8,
-
-        reg_alpha=0.1,
-
-        reg_lambda=0.1,
-
-        random_state=RANDOM_STATE,
-
-        objective="binary",
-
-        n_jobs=-1,
-
-        verbosity=-1,
-
-        class_weight="balanced"
-    )
-
-    model.fit(
-
-        X_train,
-
-        y_train,
-
-        eval_set=[
-            (
-                X_validation,
-                y_validation
-            )
-        ]
-    )
-
-    print()
-
-    print(
-        "[OK] LightGBM training complete."
-    )
-
-    return model
-
-
-# ============================================================
-# MODEL METRICS
-# ============================================================
-
-def evaluate_predictions(
-    name: str,
-    y_true,
-    predictions,
-    probabilities
-):
-
-    accuracy = accuracy_score(
-        y_true,
-        predictions
-    )
-
-    precision = precision_score(
-        y_true,
-        predictions,
-        zero_division=0
-    )
-
-    recall = recall_score(
-        y_true,
-        predictions,
-        zero_division=0
-    )
-
-    f1 = f1_score(
-        y_true,
-        predictions,
-        zero_division=0
-    )
-
-    # --------------------------------------------------------
-    # ROC-AUC can fail if test data contains only one class.
-    # --------------------------------------------------------
-
-    try:
-
-        roc_auc = roc_auc_score(
-            y_true,
-            probabilities
-        )
-
-    except ValueError:
-
-        roc_auc = 0.0
-
-    matrix = confusion_matrix(
-        y_true,
-        predictions
-    )
-
-    print()
-    print("-" * 70)
-    print(name)
-    print("-" * 70)
-
-    print(
-        f"Accuracy  : {accuracy:.4f}"
-    )
-
-    print(
-        f"Precision : {precision:.4f}"
-    )
-
-    print(
-        f"Recall    : {recall:.4f}"
-    )
-
-    print(
-        f"F1 Score  : {f1:.4f}"
-    )
-
-    print(
-        f"ROC-AUC   : {roc_auc:.4f}"
-    )
-
-    print()
-
-    print(
-        "Confusion Matrix:"
-    )
-
-    print(matrix)
-
-    print()
-
-    print(
-        classification_report(
-            y_true,
-            predictions,
-            target_names=[
-                "ON-TIME",
-                "DELAYED"
-            ],
-            zero_division=0
-        )
-    )
-
-    return {
-
-        "accuracy":
-            float(accuracy),
-
-        "precision":
-            float(precision),
-
-        "recall":
-            float(recall),
-
-        "f1":
-            float(f1),
-
-        "roc_auc":
-            float(roc_auc),
-
-        "confusion_matrix":
-            matrix.tolist()
-    }
-
-
-# ============================================================
-# SINGLE MODEL EVALUATION
-# ============================================================
-
-def evaluate_model(
-    name,
-    model,
-    X,
-    y
-):
-
-    probabilities = (
-        model
-        .predict_proba(X)
-        [:, 1]
-    )
-
-    predictions = (
-        probabilities
-        >= PREDICTION_THRESHOLD
-    ).astype(int)
-
-    return evaluate_predictions(
-        name,
-        y,
-        predictions,
-        probabilities
-    )
-
-
-# ============================================================
-# ENSEMBLE PREDICTION
-# ============================================================
-
-def ensemble_predict(
-    catboost_model,
-    lightgbm_model,
-    X
-):
-
-    catboost_probability = (
-
-        catboost_model
-        .predict_proba(X)
-        [:, 1]
-    )
-
-    lightgbm_probability = (
-
-        lightgbm_model
-        .predict_proba(X)
-        [:, 1]
-    )
-
-    # --------------------------------------------------------
-    # Weighted probability ensemble
-    # --------------------------------------------------------
-
-    ensemble_probability = (
-
-        CATBOOST_WEIGHT
-        *
-        catboost_probability
-
-        +
-
-        LIGHTGBM_WEIGHT
-        *
-        lightgbm_probability
-    )
-
-    ensemble_prediction = (
-
-        ensemble_probability
-        >= PREDICTION_THRESHOLD
-    ).astype(int)
-
-    return (
-        ensemble_prediction,
-        ensemble_probability,
-        catboost_probability,
-        lightgbm_probability
-    )
-
-
-# ============================================================
-# SAVE MODELS
-# ============================================================
-
-def save_models(
-    catboost_model,
-    lightgbm_model
-):
-
-    print()
-    print("=" * 70)
-    print("SAVING MODELS")
-    print("=" * 70)
-
-    # --------------------------------------------------------
-    # CatBoost
-    # --------------------------------------------------------
-
-    catboost_path = os.path.join(
-        MODEL_DIR,
-        "catboost_model.pkl"
-    )
-
-    joblib.dump(
-        catboost_model,
-        catboost_path
-    )
-
-    print(
-        f"[OK] {catboost_path}"
-    )
-
-    # --------------------------------------------------------
-    # LightGBM
-    # --------------------------------------------------------
-
-    lightgbm_path = os.path.join(
-        MODEL_DIR,
-        "lightgbm_model.pkl"
-    )
-
-    joblib.dump(
-        lightgbm_model,
-        lightgbm_path
-    )
-
-    print(
-        f"[OK] {lightgbm_path}"
-    )
-
-    # --------------------------------------------------------
-    # Ensemble configuration
-    # --------------------------------------------------------
-
-    ensemble_config = {
-
-        "catboost_weight":
-            CATBOOST_WEIGHT,
-
-        "lightgbm_weight":
-            LIGHTGBM_WEIGHT,
-
-        "threshold":
-            PREDICTION_THRESHOLD,
-
-        "features":
-            FEATURE_COLUMNS,
-
-        "target":
-            TARGET,
-
-        "model_type":
-            "weighted_probability_ensemble"
-    }
-
-    ensemble_path = os.path.join(
-        MODEL_DIR,
-        "ensemble_model.pkl"
-    )
-
-    joblib.dump(
-        ensemble_config,
-        ensemble_path
-    )
-
-    print(
-        f"[OK] {ensemble_path}"
-    )
-
-
-# ============================================================
-# SAVE FEATURE IMPORTANCE
-# ============================================================
-
-def save_feature_importance(
-    catboost_model,
-    lightgbm_model
-):
-
-    # --------------------------------------------------------
-    # CatBoost importance
-    # --------------------------------------------------------
-
-    catboost_importance = (
-        catboost_model
-        .get_feature_importance()
-    )
-
-    # --------------------------------------------------------
-    # LightGBM importance
-    # --------------------------------------------------------
-
-    lightgbm_importance = (
-        lightgbm_model
-        .feature_importances_
-    )
-
-    importance_df = pd.DataFrame({
-
-        "feature":
-            FEATURE_COLUMNS,
-
-        "catboost_importance":
-            catboost_importance,
-
-        "lightgbm_importance":
-            lightgbm_importance
-    })
-
-    # --------------------------------------------------------
-    # Normalize each model's importance
-    # --------------------------------------------------------
-
-    cat_total = (
-        importance_df[
-            "catboost_importance"
-        ].sum()
-    )
-
-    lgb_total = (
-        importance_df[
-            "lightgbm_importance"
-        ].sum()
-    )
-
-    if cat_total > 0:
-
-        importance_df[
-            "catboost_normalized"
-        ] = (
-            importance_df[
-                "catboost_importance"
-            ]
-            /
-            cat_total
-        )
-
-    else:
-
-        importance_df[
-            "catboost_normalized"
-        ] = 0.0
-
-    if lgb_total > 0:
-
-        importance_df[
-            "lightgbm_normalized"
-        ] = (
-            importance_df[
-                "lightgbm_importance"
-            ]
-            /
-            lgb_total
-        )
-
-    else:
-
-        importance_df[
-            "lightgbm_normalized"
-        ] = 0.0
-
-    # --------------------------------------------------------
-    # Ensemble importance
-    # --------------------------------------------------------
-
-    importance_df[
-        "ensemble_importance"
-    ] = (
-
-        CATBOOST_WEIGHT
-        *
-        importance_df[
-            "catboost_normalized"
-        ]
-
-        +
-
-        LIGHTGBM_WEIGHT
-        *
-        importance_df[
-            "lightgbm_normalized"
-        ]
-    )
-
-    importance_df = (
-        importance_df
+    result = (
+        result
         .sort_values(
-            "ensemble_importance",
-            ascending=False
+            sort_columns,
+            kind="mergesort",
         )
         .reset_index(drop=True)
     )
 
-    output_path = os.path.join(
-        MODEL_DIR,
-        "feature_importance.csv"
-    )
+    split_index = int(len(result) * (1.0 - TEST_SIZE))
 
-    importance_df.to_csv(
-        output_path,
-        index=False
+    if split_index <= 0 or split_index >= len(result):
+        raise RuntimeError("Invalid chronological 80/20 split.")
+
+    train_df = result.iloc[:split_index].copy()
+    test_df = result.iloc[split_index:].copy()
+
+    print(f"[OK] Total rows : {len(result):,}")
+    print(f"[OK] Train rows : {len(train_df):,}")
+    print(f"[OK] Test rows  : {len(test_df):,}")
+
+    print()
+    print("TRAIN DATE RANGE")
+    print(
+        f"  {train_df['flight_datetime'].min()} "
+        f"-> "
+        f"{train_df['flight_datetime'].max()}"
     )
 
     print()
+    print("TEST DATE RANGE")
     print(
-        f"[OK] Feature importance saved:"
+        f"  {test_df['flight_datetime'].min()} "
+        f"-> "
+        f"{test_df['flight_datetime'].max()}"
     )
 
-    print(
-        f"     {output_path}"
-    )
-
-    print()
-
-    print(
-        "Top 10 features:"
-    )
-
-    print(
-        importance_df[
-            [
-                "feature",
-                "ensemble_importance"
-            ]
-        ].head(10).to_string(
-            index=False
+    if (
+        train_df["flight_datetime"].max()
+        > test_df["flight_datetime"].min()
+    ):
+        raise RuntimeError(
+            "Chronological leakage detected: "
+            "training data extends into the test period."
         )
+
+    print("[OK] No chronological overlap.")
+
+    return train_df, test_df
+
+
+# ============================================================================
+# MODEL-SPECIFIC PREPROCESSING
+# ============================================================================
+
+def prepare_model_features(
+    train_df: pd.DataFrame,
+    test_df: pd.DataFrame,
+    feature_columns: list[str],
+    model_name: str,
+) -> tuple[pd.DataFrame, pd.DataFrame, OrdinalEncoder, list[str]]:
+    """
+    Prepare a feature matrix for ONE model.
+
+    Encoder and numerical imputation are fitted on training data only.
+    """
+
+    print()
+    print("-" * 70)
+    print(f"PREPARING {model_name} FEATURES")
+    print("-" * 70)
+
+    missing_train = [
+        c for c in feature_columns
+        if c not in train_df.columns
+    ]
+    missing_test = [
+        c for c in feature_columns
+        if c not in test_df.columns
+    ]
+
+    if missing_train or missing_test:
+        raise RuntimeError(
+            f"{model_name} feature mismatch.\n"
+            f"Missing from train: {missing_train}\n"
+            f"Missing from test : {missing_test}"
+        )
+
+    X_train = train_df[feature_columns].copy()
+    X_test = test_df[feature_columns].copy()
+
+    categorical_features = [
+        c for c in CATEGORICAL_FEATURES
+        if c in feature_columns
+    ]
+
+    numerical_features = [
+        c for c in feature_columns
+        if c not in categorical_features
+    ]
+
+    encoder = OrdinalEncoder(
+        handle_unknown="use_encoded_value",
+        unknown_value=-1,
     )
 
-    return importance_df
+    # Categorical encoding is fitted ONLY on training data.
+    if categorical_features:
+        X_train[categorical_features] = normalize_categorical_columns(
+            X_train,
+            categorical_features,
+        )[categorical_features]
+
+        X_test[categorical_features] = normalize_categorical_columns(
+            X_test,
+            categorical_features,
+        )[categorical_features]
+
+        X_train[categorical_features] = encoder.fit_transform(
+            X_train[categorical_features]
+        )
+
+        X_test[categorical_features] = encoder.transform(
+            X_test[categorical_features]
+        )
+
+    # Numerical conversion and training-only median imputation.
+    for column in numerical_features:
+        X_train[column] = pd.to_numeric(
+            X_train[column],
+            errors="coerce",
+        )
+
+        X_test[column] = pd.to_numeric(
+            X_test[column],
+            errors="coerce",
+        )
+
+        X_train[column] = X_train[column].replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+
+        X_test[column] = X_test[column].replace(
+            [np.inf, -np.inf],
+            np.nan,
+        )
+
+        median_value = X_train[column].median()
+
+        if pd.isna(median_value):
+            median_value = 0.0
+
+        X_train[column] = X_train[column].fillna(median_value)
+        X_test[column] = X_test[column].fillna(median_value)
+
+    # Consistent numeric dtype.
+    X_train = X_train.astype(np.float32)
+    X_test = X_test.astype(np.float32)
+
+    print(f"[OK] {model_name} features: {len(feature_columns)}")
+    print(f"[OK] Categorical: {len(categorical_features)}")
+    print(f"[OK] Numerical: {len(numerical_features)}")
+    print(f"[OK] Train shape: {X_train.shape}")
+    print(f"[OK] Test shape : {X_test.shape}")
+
+    return (
+        X_train,
+        X_test,
+        encoder,
+        numerical_features,
+    )
 
 
-# ============================================================
-# SAVE METRICS
-# ============================================================
+# ============================================================================
+# XGBOOST CLASSIFIER
+# ============================================================================
 
-def save_metrics(
-    catboost_metrics,
-    lightgbm_metrics,
-    ensemble_metrics,
-    train_df,
-    validation_df,
-    test_df
-):
+def train_xgboost(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+) -> XGBClassifier:
+
+    print()
+    print("=" * 70)
+    print("TRAINING XGBOOST CLASSIFIER")
+    print("=" * 70)
+
+    positive = int(y_train.sum())
+    negative = int(len(y_train) - positive)
+
+    if positive == 0 or negative == 0:
+        raise RuntimeError(
+            "Training classification target must contain both classes."
+        )
+
+    scale_pos_weight = negative / positive
+
+    print(f"[INFO] Positive samples : {positive:,}")
+    print(f"[INFO] Negative samples : {negative:,}")
+    print(f"[INFO] Class weight     : {scale_pos_weight:.3f}")
+    print(f"[INFO] Trees            : {XGB_TREES}")
+    print(f"[INFO] Learning rate    : {XGB_LEARNING_RATE}")
+
+    model = XGBClassifier(
+        n_estimators=XGB_TREES,
+        learning_rate=XGB_LEARNING_RATE,
+        max_depth=XGB_MAX_DEPTH,
+        min_child_weight=XGB_MIN_CHILD_WEIGHT,
+        subsample=XGB_SUBSAMPLE,
+        colsample_bytree=XGB_COLSAMPLE,
+        reg_alpha=XGB_REG_ALPHA,
+        reg_lambda=XGB_REG_LAMBDA,
+        objective="binary:logistic",
+        eval_metric="logloss",
+        tree_method="hist",
+        scale_pos_weight=scale_pos_weight,
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+        verbosity=0,
+    )
+
+    print("[INFO] Training...")
+    model.fit(X_train, y_train)
+
+    print("[OK] XGBoost training complete.")
+
+    return model
+
+
+# ============================================================================
+# LIGHTGBM REGRESSOR
+# ============================================================================
+
+def train_lightgbm(
+    X_train: pd.DataFrame,
+    y_train: pd.Series,
+) -> LGBMRegressor:
+
+    print()
+    print("=" * 70)
+    print("TRAINING LIGHTGBM REGRESSOR")
+    print("=" * 70)
+
+    print(f"[INFO] Trees         : {LGB_TREES}")
+    print(f"[INFO] Learning rate : {LGB_LEARNING_RATE}")
+    print(f"[INFO] Num leaves    : {LGB_NUM_LEAVES}")
+
+    model = LGBMRegressor(
+        n_estimators=LGB_TREES,
+        learning_rate=LGB_LEARNING_RATE,
+        num_leaves=LGB_NUM_LEAVES,
+        max_depth=LGB_MAX_DEPTH,
+        min_child_samples=LGB_MIN_CHILD_SAMPLES,
+        subsample=LGB_SUBSAMPLE,
+        colsample_bytree=LGB_COLSAMPLE,
+        objective="regression",
+        n_jobs=-1,
+        random_state=RANDOM_STATE,
+        verbosity=-1,
+    )
+
+    print("[INFO] Training...")
+    model.fit(X_train, y_train)
+
+    print("[OK] LightGBM training complete.")
+
+    return model
+
+
+# ============================================================================
+# EVALUATION
+# ============================================================================
+
+def evaluate_classifier(
+    model: XGBClassifier,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+) -> tuple[dict, np.ndarray]:
+
+    print()
+    print("=" * 70)
+    print("XGBOOST CLASSIFICATION RESULTS")
+    print("=" * 70)
+
+    probabilities = model.predict_proba(X_test)[:, 1]
+
+    predictions = (
+        probabilities >= CLASSIFICATION_THRESHOLD
+    ).astype(np.int8)
+
+    accuracy = accuracy_score(y_test, predictions)
+    precision = precision_score(
+        y_test,
+        predictions,
+        zero_division=0,
+    )
+    recall = recall_score(
+        y_test,
+        predictions,
+        zero_division=0,
+    )
+    f1 = f1_score(
+        y_test,
+        predictions,
+        zero_division=0,
+    )
+    auc = roc_auc_score(
+        y_test,
+        probabilities,
+    )
+
+    matrix = confusion_matrix(
+        y_test,
+        predictions,
+    )
+
+    report = classification_report(
+        y_test,
+        predictions,
+        output_dict=True,
+        zero_division=0,
+    )
+
+    print(f"Accuracy : {accuracy:.4f}")
+    print(f"Precision: {precision:.4f}")
+    print(f"Recall   : {recall:.4f}")
+    print(f"F1 Score : {f1:.4f}")
+    print(f"ROC-AUC  : {auc:.4f}")
+    print(f"Threshold: {CLASSIFICATION_THRESHOLD:.2f}")
+
+    print()
+    print("Confusion Matrix:")
+    print(matrix)
 
     metrics = {
-
-        "models": {
-
-            "catboost":
-                catboost_metrics,
-
-            "lightgbm":
-                lightgbm_metrics,
-
-            "ensemble":
-                ensemble_metrics
-        },
-
-        "ensemble_configuration": {
-
-            "catboost_weight":
-                CATBOOST_WEIGHT,
-
-            "lightgbm_weight":
-                LIGHTGBM_WEIGHT,
-
-            "threshold":
-                PREDICTION_THRESHOLD
-        },
-
-        "dataset": {
-
-            "total_rows":
-                (
-                    len(train_df)
-                    +
-                    len(validation_df)
-                    +
-                    len(test_df)
-                ),
-
-            "train_rows":
-                len(train_df),
-
-            "validation_rows":
-                len(validation_df),
-
-            "test_rows":
-                len(test_df),
-
-            "train_start":
-                str(
-                    train_df[
-                        DATE_COLUMN
-                    ].min()
-                ),
-
-            "train_end":
-                str(
-                    train_df[
-                        DATE_COLUMN
-                    ].max()
-                ),
-
-            "validation_start":
-                str(
-                    validation_df[
-                        DATE_COLUMN
-                    ].min()
-                ),
-
-            "validation_end":
-                str(
-                    validation_df[
-                        DATE_COLUMN
-                    ].max()
-                ),
-
-            "test_start":
-                str(
-                    test_df[
-                        DATE_COLUMN
-                    ].min()
-                ),
-
-            "test_end":
-                str(
-                    test_df[
-                        DATE_COLUMN
-                    ].max()
-                )
-        },
-
-        "features": FEATURE_COLUMNS,
-
-        "target": TARGET
+        "accuracy": float(accuracy),
+        "precision": float(precision),
+        "recall": float(recall),
+        "f1_score": float(f1),
+        "roc_auc": float(auc),
+        "threshold": float(CLASSIFICATION_THRESHOLD),
+        "confusion_matrix": matrix.tolist(),
+        "classification_report": report,
     }
 
-    path = os.path.join(
-        MODEL_DIR,
-        "metrics.json"
-    )
+    return metrics, probabilities
 
-    with open(
-        path,
-        "w",
-        encoding="utf-8"
-    ) as file:
 
-        json.dump(
-            metrics,
-            file,
-            indent=4
-        )
+def evaluate_regressor(
+    model: LGBMRegressor,
+    X_test: pd.DataFrame,
+    y_test: pd.Series,
+) -> tuple[dict, np.ndarray]:
 
     print()
-    print(
-        f"[OK] Metrics saved:"
+    print("=" * 70)
+    print("LIGHTGBM REGRESSION RESULTS")
+    print("=" * 70)
+
+    predictions = model.predict(X_test)
+    predictions = np.maximum(predictions, 0.0)
+
+    mae = mean_absolute_error(
+        y_test,
+        predictions,
     )
 
+    rmse = np.sqrt(
+        mean_squared_error(
+            y_test,
+            predictions,
+        )
+    )
+
+    r2 = r2_score(
+        y_test,
+        predictions,
+    )
+
+    print(f"MAE : {mae:.4f} minutes")
+    print(f"RMSE: {rmse:.4f} minutes")
+    print(f"R²  : {r2:.4f}")
+
+    metrics = {
+        "mae_minutes": float(mae),
+        "rmse_minutes": float(rmse),
+        "r2": float(r2),
+    }
+
+    return metrics, predictions
+
+
+# ============================================================================
+# FEATURE IMPORTANCE
+# ============================================================================
+
+def save_feature_importance(
+    xgb_model: XGBClassifier,
+    lgb_model: LGBMRegressor,
+) -> None:
+
+    print()
+    print("=" * 70)
+    print("FEATURE IMPORTANCE")
+    print("=" * 70)
+
+    xgb_df = pd.DataFrame({
+        "feature": XGB_FEATURES,
+        "xgboost_importance": (
+            xgb_model.feature_importances_
+        ),
+    })
+
+    lgb_df = pd.DataFrame({
+        "feature": LGBM_FEATURES,
+        "lightgbm_importance": (
+            lgb_model.feature_importances_
+        ),
+    })
+
+    importance = pd.merge(
+        xgb_df,
+        lgb_df,
+        on="feature",
+        how="outer",
+    ).fillna(0.0)
+
+    importance = importance.sort_values(
+        "xgboost_importance",
+        ascending=False,
+    )
+
+    output_file = ARTIFACT_DIR / "feature_importance.csv"
+
+    importance.to_csv(
+        output_file,
+        index=False,
+    )
+
+    print(f"[OK] Feature importance saved: {output_file}")
+
+    print()
+    print("TOP FEATURES")
+    print("-" * 70)
     print(
-        f"     {path}"
+        importance.head(20).to_string(index=False)
     )
 
 
-# ============================================================
-# SAVE TEST PREDICTIONS
-# ============================================================
+# ============================================================================
+# TEST PREDICTIONS
+# ============================================================================
+
+def decision_from_minutes(minutes: float) -> str:
+    if minutes < 15:
+        return "NORMAL_WAIT"
+
+    if minutes < 30:
+        return "MANUAL_ACTION"
+
+    return "AUTOMATIC_ACTION"
+
 
 def save_test_predictions(
-    test_df,
-    y_test,
-    catboost_probability,
-    lightgbm_probability,
-    ensemble_probability,
-    ensemble_prediction
-):
+    test_df: pd.DataFrame,
+    xgb_model: XGBClassifier,
+    lgb_model: LGBMRegressor,
+    XGB_test: pd.DataFrame,
+    LGBM_test: pd.DataFrame,
+    classification_probabilities: np.ndarray,
+    regression_predictions: np.ndarray,
+) -> None:
 
-    output = test_df[
-        [
-            ID_COLUMN,
-            DATE_COLUMN
-        ]
-    ].copy()
+    result = pd.DataFrame({
+        "flight_id": test_df["flight_id"].values,
+        "flight_datetime": test_df["flight_datetime"].values,
+        "actual_delayed_15": (
+            test_df[TARGET_CLASSIFICATION].values
+        ),
+        "actual_delay_minutes": (
+            test_df[TARGET_REGRESSION].values
+        ),
+        "delay_probability": classification_probabilities,
+        "predicted_delayed_15": (
+            classification_probabilities
+            >= CLASSIFICATION_THRESHOLD
+        ).astype(np.int8),
+        "predicted_delay_minutes": regression_predictions,
+    })
 
-    output[
-        "actual_delay"
-    ] = y_test.values
-
-    output[
-        "catboost_probability"
-    ] = catboost_probability
-
-    output[
-        "lightgbm_probability"
-    ] = lightgbm_probability
-
-    output[
-        "ensemble_probability"
-    ] = ensemble_probability
-
-    output[
-        "predicted_delay"
-    ] = ensemble_prediction
-
-    output[
-        "risk_level"
-    ] = pd.cut(
-
-        ensemble_probability,
-
-        bins=[
-            -np.inf,
-            0.30,
-            0.60,
-            0.80,
-            np.inf
-        ],
-
-        labels=[
-            "LOW",
-            "MEDIUM",
-            "HIGH",
-            "VERY_HIGH"
-        ]
+    result["delay_probability_percent"] = (
+        result["delay_probability"] * 100.0
     )
 
-    path = os.path.join(
-        MODEL_DIR,
-        "test_predictions.csv"
+    result["risk_level"] = result.apply(
+        lambda row: (
+            "HIGH"
+            if row["predicted_delay_minutes"] >= 30
+            or row["delay_probability"] >= 0.70
+            else (
+                "MEDIUM"
+                if row["predicted_delay_minutes"] >= 15
+                or row["delay_probability"] >= 0.50
+                else "LOW"
+            )
+        ),
+        axis=1,
     )
 
-    output.to_csv(
-        path,
-        index=False
+    result["recommended_action"] = (
+        result["predicted_delay_minutes"]
+        .apply(decision_from_minutes)
     )
+
+    output_file = ARTIFACT_DIR / "test_predictions.parquet"
+
+    result.to_parquet(
+        output_file,
+        index=False,
+        engine="pyarrow",
+    )
+
+    print(f"[OK] Test predictions saved: {output_file}")
+
+
+# ============================================================================
+# SAVE JSON
+# ============================================================================
+
+def save_json(
+    filename: str,
+    data: dict,
+) -> None:
+
+    output_file = ARTIFACT_DIR / filename
+
+    with open(
+        output_file,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            data,
+            file,
+            indent=2,
+            default=str,
+        )
+
+    print(f"[OK] Saved: {output_file}")
+
+
+# ============================================================================
+# SAVE MODELS + DUAL FEATURE SCHEMA
+# ============================================================================
+
+def save_models(
+    xgb_model: XGBClassifier,
+    lgb_model: LGBMRegressor,
+    xgb_encoder: OrdinalEncoder,
+    lgb_encoder: OrdinalEncoder,
+    metrics: dict,
+) -> None:
 
     print()
-    print(
-        f"[OK] Test predictions saved:"
-    )
+    print("=" * 70)
+    print("SAVING FINAL MODELS")
+    print("=" * 70)
 
-    print(
-        f"     {path}"
-    )
+    xgb_file = MODEL_DIR / "xgboost_classifier.pkl"
+
+    with open(xgb_file, "wb") as file:
+        pickle.dump(
+            xgb_model,
+            file,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+    print(f"[OK] XGBoost: {xgb_file}")
+
+    lgb_file = MODEL_DIR / "lightgbm_regressor.pkl"
+
+    with open(lgb_file, "wb") as file:
+        pickle.dump(
+            lgb_model,
+            file,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+    print(f"[OK] LightGBM: {lgb_file}")
+
+    # IMPORTANT:
+    # Keep separate encoders because the two models use different
+    # feature sets.
+    xgb_categorical = [
+        c for c in CATEGORICAL_FEATURES
+        if c in XGB_FEATURES
+    ]
+
+    lgb_categorical = [
+        c for c in CATEGORICAL_FEATURES
+        if c in LGBM_FEATURES
+    ]
+
+    xgb_numerical = [
+        c for c in XGB_FEATURES
+        if c not in xgb_categorical
+    ]
+
+    lgb_numerical = [
+        c for c in LGBM_FEATURES
+        if c not in lgb_categorical
+    ]
+
+    schema = {
+        "architecture": "dual_model",
+        "xgboost": {
+            "feature_columns": XGB_FEATURES,
+            "categorical_features": xgb_categorical,
+            "numerical_features": xgb_numerical,
+            "encoder": xgb_encoder,
+        },
+        "lightgbm": {
+            "feature_columns": LGBM_FEATURES,
+            "categorical_features": lgb_categorical,
+            "numerical_features": lgb_numerical,
+            "encoder": lgb_encoder,
+        },
+        "master_features": MODEL_FEATURES,
+        "classification_target": TARGET_CLASSIFICATION,
+        "regression_target": TARGET_REGRESSION,
+        "classification_threshold": CLASSIFICATION_THRESHOLD,
+        "decision_policy": {
+            "normal_wait": "<15 minutes",
+            "manual_action": "15-29 minutes",
+            "automatic_action": ">=30 minutes",
+        },
+        "weather": "removed",
+        "test_size": TEST_SIZE,
+        "split": "chronological",
+    }
+
+    schema_file = MODEL_DIR / "feature_schema.pkl"
+
+    with open(schema_file, "wb") as file:
+        pickle.dump(
+            schema,
+            file,
+            protocol=pickle.HIGHEST_PROTOCOL,
+        )
+
+    print(f"[OK] Feature schema: {schema_file}")
+
+    metadata = {
+        "project": "FLITZZ",
+        "architecture": "XGBoost classification + LightGBM regression",
+        "features": {
+            "master": len(MODEL_FEATURES),
+            "xgboost": len(XGB_FEATURES),
+            "lightgbm": len(LGBM_FEATURES),
+        },
+        "targets": {
+            "classification": TARGET_CLASSIFICATION,
+            "regression": TARGET_REGRESSION,
+        },
+        "training": {
+            "total_rows": metrics["data"]["total_rows"],
+            "train_rows": metrics["data"]["train_rows"],
+            "test_rows": metrics["data"]["test_rows"],
+            "test_size": TEST_SIZE,
+            "split": "chronological_80_20",
+            "random_state": RANDOM_STATE,
+        },
+        "xgboost": {
+            "trees": XGB_TREES,
+            "learning_rate": XGB_LEARNING_RATE,
+            "max_depth": XGB_MAX_DEPTH,
+            "min_child_weight": XGB_MIN_CHILD_WEIGHT,
+            "classification_threshold": CLASSIFICATION_THRESHOLD,
+        },
+        "lightgbm": {
+            "trees": LGB_TREES,
+            "learning_rate": LGB_LEARNING_RATE,
+            "num_leaves": LGB_NUM_LEAVES,
+            "max_depth": LGB_MAX_DEPTH,
+            "min_child_samples": LGB_MIN_CHILD_SAMPLES,
+        },
+        "weather": "removed",
+        "classification": metrics["classification"],
+        "regression": metrics["regression"],
+    }
+
+    metadata_file = MODEL_DIR / "model_metadata.json"
+
+    with open(
+        metadata_file,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            metadata,
+            file,
+            indent=2,
+            default=str,
+        )
+
+    print(f"[OK] Metadata: {metadata_file}")
 
 
-# ============================================================
-# MAIN TRAINING PIPELINE
-# ============================================================
+# ============================================================================
+# MAIN
+# ============================================================================
 
 def main():
 
+    start_time = time.time()
+
     print()
     print("=" * 70)
-    print("FLITZZ DELAY PREDICTION")
-    print("CATBOOST + LIGHTGBM ENSEMBLE")
+    print("FLITZZ - DUAL MODEL TRAINING")
     print("=" * 70)
 
-    # ========================================================
-    # STEP 1
-    # PostgreSQL -> Feature Builder
-    # ========================================================
+    print()
+    print("[INFO] XGBoost  -> classification >= 15 min")
+    print("[INFO] LightGBM -> regression delay minutes")
+    print("[INFO] Split     -> chronological 80/20")
+    print("[INFO] Validation set -> NONE")
+    print("[INFO] Weather -> REMOVED")
+
+    # ------------------------------------------------------------------------
+    # Load
+    # ------------------------------------------------------------------------
 
     df = load_dataset()
 
-    # ========================================================
-    # STEP 2
-    # Prepare
-    # ========================================================
+    # ------------------------------------------------------------------------
+    # Feature contract
+    # ------------------------------------------------------------------------
 
-    df = prepare_data(
-        df
+    validate_feature_contracts(df)
+
+    # ------------------------------------------------------------------------
+    # Targets
+    # ------------------------------------------------------------------------
+
+    df = prepare_targets(df)
+
+    # ------------------------------------------------------------------------
+    # Split
+    # ------------------------------------------------------------------------
+
+    train_df, test_df = chronological_split(df)
+
+    # ------------------------------------------------------------------------
+    # Classification targets
+    # ------------------------------------------------------------------------
+
+    y_train_classification = (
+        train_df[TARGET_CLASSIFICATION]
+        .astype(np.int8)
     )
 
-    # ========================================================
-    # STEP 3
-    # Chronological split
-    # ========================================================
+    y_test_classification = (
+        test_df[TARGET_CLASSIFICATION]
+        .astype(np.int8)
+    )
+
+    # ------------------------------------------------------------------------
+    # Regression targets
+    # ------------------------------------------------------------------------
+
+    y_train_regression = (
+        train_df[TARGET_REGRESSION]
+        .astype(np.float32)
+    )
+
+    y_test_regression = (
+        test_df[TARGET_REGRESSION]
+        .astype(np.float32)
+    )
+
+    # ------------------------------------------------------------------------
+    # XGBoost feature preparation
+    # ------------------------------------------------------------------------
 
     (
-        train_df,
-        validation_df,
-        test_df
-    ) = time_split(
-        df
+        XGB_train,
+        XGB_test,
+        xgb_encoder,
+        _,
+    ) = prepare_model_features(
+        train_df=train_df,
+        test_df=test_df,
+        feature_columns=XGB_FEATURES,
+        model_name="XGBOOST",
     )
 
-    # ========================================================
-    # STEP 4
-    # X / Y
-    # ========================================================
-
-    X_train, y_train = xy_split(
-        train_df
-    )
-
-    X_validation, y_validation = xy_split(
-        validation_df
-    )
-
-    X_test, y_test = xy_split(
-        test_df
-    )
-
-    print()
-    print(
-        f"[OK] Training features: "
-        f"{X_train.shape}"
-    )
-
-    print(
-        f"[OK] Validation features: "
-        f"{X_validation.shape}"
-    )
-
-    print(
-        f"[OK] Test features: "
-        f"{X_test.shape}"
-    )
-
-    # ========================================================
-    # STEP 5
-    # CatBoost
-    # ========================================================
-
-    catboost_model = train_catboost(
-
-        X_train,
-        y_train,
-
-        X_validation,
-        y_validation
-    )
-
-    # ========================================================
-    # STEP 6
-    # LightGBM
-    # ========================================================
-
-    lightgbm_model = train_lightgbm(
-
-        X_train,
-        y_train,
-
-        X_validation,
-        y_validation
-    )
-
-    # ========================================================
-    # STEP 7
-    # Individual model evaluation
-    # ========================================================
-
-    print()
-    print("=" * 70)
-    print("FINAL TEST SET EVALUATION")
-    print("=" * 70)
-
-    catboost_metrics = evaluate_model(
-
-        "CATBOOST",
-
-        catboost_model,
-
-        X_test,
-        y_test
-    )
-
-    lightgbm_metrics = evaluate_model(
-
-        "LIGHTGBM",
-
-        lightgbm_model,
-
-        X_test,
-        y_test
-    )
-
-    # ========================================================
-    # STEP 8
-    # Ensemble
-    # ========================================================
+    # ------------------------------------------------------------------------
+    # LightGBM feature preparation
+    # ------------------------------------------------------------------------
 
     (
-        ensemble_prediction,
-        ensemble_probability,
-        catboost_probability,
-        lightgbm_probability
-
-    ) = ensemble_predict(
-
-        catboost_model,
-
-        lightgbm_model,
-
-        X_test
+        LGBM_train,
+        LGBM_test,
+        lgb_encoder,
+        _,
+    ) = prepare_model_features(
+        train_df=train_df,
+        test_df=test_df,
+        feature_columns=LGBM_FEATURES,
+        model_name="LIGHTGBM",
     )
 
-    ensemble_metrics = evaluate_predictions(
+    # ------------------------------------------------------------------------
+    # Train XGBoost
+    # ------------------------------------------------------------------------
 
-        "CATBOOST + LIGHTGBM ENSEMBLE",
-
-        y_test,
-
-        ensemble_prediction,
-
-        ensemble_probability
+    xgb_model = train_xgboost(
+        XGB_train,
+        y_train_classification,
     )
 
-    # ========================================================
-    # STEP 9
-    # Save models
-    # ========================================================
+    # ------------------------------------------------------------------------
+    # Train LightGBM
+    # ------------------------------------------------------------------------
 
-    save_models(
-
-        catboost_model,
-
-        lightgbm_model
+    lgb_model = train_lightgbm(
+        LGBM_train,
+        y_train_regression,
     )
 
-    # ========================================================
-    # STEP 10
+    # ------------------------------------------------------------------------
+    # Evaluate
+    # ------------------------------------------------------------------------
+
+    classification_metrics, classification_probabilities = (
+        evaluate_classifier(
+            xgb_model,
+            XGB_test,
+            y_test_classification,
+        )
+    )
+
+    regression_metrics, regression_predictions = (
+        evaluate_regressor(
+            lgb_model,
+            LGBM_test,
+            y_test_regression,
+        )
+    )
+
+    # ------------------------------------------------------------------------
     # Feature importance
-    # ========================================================
+    # ------------------------------------------------------------------------
 
     save_feature_importance(
-
-        catboost_model,
-
-        lightgbm_model
+        xgb_model=xgb_model,
+        lgb_model=lgb_model,
     )
 
-    # ========================================================
-    # STEP 11
-    # Metrics
-    # ========================================================
-
-    save_metrics(
-
-        catboost_metrics,
-
-        lightgbm_metrics,
-
-        ensemble_metrics,
-
-        train_df,
-
-        validation_df,
-
-        test_df
-    )
-
-    # ========================================================
-    # STEP 12
+    # ------------------------------------------------------------------------
     # Test predictions
-    # ========================================================
+    # ------------------------------------------------------------------------
 
     save_test_predictions(
-
-        test_df,
-
-        y_test,
-
-        catboost_probability,
-
-        lightgbm_probability,
-
-        ensemble_probability,
-
-        ensemble_prediction
+        test_df=test_df,
+        xgb_model=xgb_model,
+        lgb_model=lgb_model,
+        XGB_test=XGB_test,
+        LGBM_test=LGBM_test,
+        classification_probabilities=classification_probabilities,
+        regression_predictions=regression_predictions,
     )
 
-    # ========================================================
-    # FINAL SUMMARY
-    # ========================================================
+    # ------------------------------------------------------------------------
+    # Metrics
+    # ------------------------------------------------------------------------
+
+    metrics = {
+        "data": {
+            "total_rows": int(len(df)),
+            "train_rows": int(len(train_df)),
+            "test_rows": int(len(test_df)),
+            "xgboost_features": int(len(XGB_FEATURES)),
+            "lightgbm_features": int(len(LGBM_FEATURES)),
+            "master_features": int(len(MODEL_FEATURES)),
+        },
+        "classification": classification_metrics,
+        "regression": regression_metrics,
+    }
+
+    save_json(
+        "metrics.json",
+        metrics,
+    )
+
+    save_json(
+        "classification_report.json",
+        classification_metrics["classification_report"],
+    )
+
+    save_json(
+        "regression_metrics.json",
+        regression_metrics,
+    )
+
+    # ------------------------------------------------------------------------
+    # Save models
+    # ------------------------------------------------------------------------
+
+    save_models(
+        xgb_model=xgb_model,
+        lgb_model=lgb_model,
+        xgb_encoder=xgb_encoder,
+        lgb_encoder=lgb_encoder,
+        metrics=metrics,
+    )
+
+    # ------------------------------------------------------------------------
+    # Final summary
+    # ------------------------------------------------------------------------
+
+    elapsed = time.time() - start_time
 
     print()
     print("=" * 70)
-    print("TRAINING COMPLETE")
+    print("FLITZZ DUAL MODEL TRAINING COMPLETE")
     print("=" * 70)
 
     print()
-
-    print(
-        f"CatBoost ROC-AUC : "
-        f"{catboost_metrics['roc_auc']:.4f}"
-    )
-
-    print(
-        f"LightGBM ROC-AUC : "
-        f"{lightgbm_metrics['roc_auc']:.4f}"
-    )
-
-    print(
-        f"Ensemble ROC-AUC : "
-        f"{ensemble_metrics['roc_auc']:.4f}"
-    )
+    print("DATA")
+    print("-" * 70)
+    print(f"Total rows        : {len(df):,}")
+    print(f"Training rows     : {len(train_df):,}")
+    print(f"Test rows         : {len(test_df):,}")
+    print(f"XGBoost features  : {len(XGB_FEATURES)}")
+    print(f"LightGBM features : {len(LGBM_FEATURES)}")
+    print("Split             : 80% train / 20% test")
+    print("Validation        : NONE")
+    print("Weather           : REMOVED")
 
     print()
-
-    print(
-        f"Ensemble Accuracy : "
-        f"{ensemble_metrics['accuracy']:.4f}"
-    )
-
-    print(
-        f"Ensemble Precision: "
-        f"{ensemble_metrics['precision']:.4f}"
-    )
-
-    print(
-        f"Ensemble Recall   : "
-        f"{ensemble_metrics['recall']:.4f}"
-    )
-
-    print(
-        f"Ensemble F1       : "
-        f"{ensemble_metrics['f1']:.4f}"
-    )
+    print("XGBOOST CLASSIFICATION")
+    print("-" * 70)
+    print(f"Accuracy : {classification_metrics['accuracy']:.4f}")
+    print(f"Precision: {classification_metrics['precision']:.4f}")
+    print(f"Recall   : {classification_metrics['recall']:.4f}")
+    print(f"F1 Score : {classification_metrics['f1_score']:.4f}")
+    print(f"ROC-AUC  : {classification_metrics['roc_auc']:.4f}")
+    print(f"Threshold: {classification_metrics['threshold']:.2f}")
 
     print()
-
-    print(
-        "Saved files:"
-    )
-
-    print(
-        f"  {MODEL_DIR}/catboost_model.pkl"
-    )
-
-    print(
-        f"  {MODEL_DIR}/lightgbm_model.pkl"
-    )
-
-    print(
-        f"  {MODEL_DIR}/ensemble_model.pkl"
-    )
-
-    print(
-        f"  {MODEL_DIR}/metrics.json"
-    )
-
-    print(
-        f"  {MODEL_DIR}/feature_importance.csv"
-    )
-
-    print(
-        f"  {MODEL_DIR}/test_predictions.csv"
-    )
+    print("LIGHTGBM REGRESSION")
+    print("-" * 70)
+    print(f"MAE : {regression_metrics['mae_minutes']:.4f} min")
+    print(f"RMSE: {regression_metrics['rmse_minutes']:.4f} min")
+    print(f"R²  : {regression_metrics['r2']:.4f}")
 
     print()
+    print("MODEL FILES")
+    print("-" * 70)
+    print(MODEL_DIR / "xgboost_classifier.pkl")
+    print(MODEL_DIR / "lightgbm_regressor.pkl")
+    print(MODEL_DIR / "feature_schema.pkl")
+    print(MODEL_DIR / "model_metadata.json")
 
-    print(
-        "[SUCCESS] FLITZZ ML training pipeline finished."
-    )
+    print()
+    print(f"Training time: {elapsed:.2f} seconds")
 
+    print()
+    print("=" * 70)
 
-# ============================================================
-# ENTRY POINT
-# ============================================================
 
 if __name__ == "__main__":
-
     main()
