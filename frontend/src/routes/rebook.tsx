@@ -900,7 +900,7 @@ export function RebookPage() {
 
           {data && (
             <>
-          {/* =================================================
+                {/* =================================================
                   FLIGHT HEADER
                 ================================================= */}
 
@@ -933,8 +933,7 @@ export function RebookPage() {
                         {getDestination(
                           data.flight,
                         )}
-                      </>
-                    )}
+                      </p>
 
                       <p className="mt-1 text-xs text-muted-foreground">
                         Flight ID{" "}

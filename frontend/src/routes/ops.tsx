@@ -45,6 +45,30 @@ type CrewMember = {
   dutyRemaining: string;
   dutyLimitWarning?: boolean;
   status: "Assigned" | "Standby" | "Off Duty";
+  selected?: boolean;
+  assignmentId?: number;
+};
+
+type PredictionContext = {
+  flight?: { flight_id?: number; flight_number?: string };
+  prediction?: {
+    predicted_arrival_delay_minutes?: number;
+    risk_level?: string;
+    recommended_action?: string;
+  };
+  response?: {
+    flight?: { flight_id?: number; flight_number?: string };
+    prediction?: PredictionContext["prediction"];
+    action?: { level?: string; message?: string };
+    reasons?: Array<{ title: string; description: string }>;
+  };
+};
+
+type Assignment = {
+  assignment_id: number;
+  crew_id: number;
+  crew_name: string;
+  assignment_role: string;
 };
 
 type AircraftTurnaround = {
@@ -61,49 +85,7 @@ type AircraftTurnaround = {
   turnaroundEstMin: number;
 };
 
-const INITIAL_CREW: CrewMember[] = [
-  {
-    id: "c-1",
-    name: "Capt. Alexander Vance",
-    role: "Captain",
-    flightNo: "DL1492",
-    dutyRemaining: "2h 45m",
-    dutyLimitWarning: true,
-    status: "Assigned",
-  },
-  {
-    id: "c-2",
-    name: "F/O Sarah Jenkins",
-    role: "First Officer",
-    flightNo: "DL1492",
-    dutyRemaining: "6h 10m",
-    status: "Assigned",
-  },
-  {
-    id: "c-3",
-    name: "Capt. Michael Thorne (Standby)",
-    role: "Captain",
-    flightNo: "Standby Pool",
-    dutyRemaining: "9h 30m",
-    status: "Standby",
-  },
-  {
-    id: "c-4",
-    name: "Capt. Robert Sterling",
-    role: "Captain",
-    flightNo: "UA890",
-    dutyRemaining: "7h 15m",
-    status: "Assigned",
-  },
-  {
-    id: "c-5",
-    name: "Lead Flight Att. Chloe Bennett",
-    role: "Lead Attendant",
-    flightNo: "BA117",
-    dutyRemaining: "5h 20m",
-    status: "Assigned",
-  },
-];
+const INITIAL_CREW: CrewMember[] = [];
 
 const INITIAL_TURNAROUND: AircraftTurnaround[] = [
   {
@@ -149,11 +131,80 @@ export function OpsManagerPage() {
   const [turnaroundList, setTurnaroundList] = useState<AircraftTurnaround[]>(INITIAL_TURNAROUND);
   const [dispatching, setDispatching] = useState(false);
   const [crewFlightId, setCrewFlightId] = useState("");
+  const [prediction, setPrediction] = useState<PredictionContext | null>(null);
+  const [loadingCrew, setLoadingCrew] = useState(false);
+  const [savingAssignments, setSavingAssignments] = useState(false);
+
+  const apiUrl = import.meta.env.VITE_API_URL || "http://localhost:8000";
+
+  function recommendationForDelay(delay: number) {
+    if (delay >= 30) {
+      return {
+        label: "Automatic recovery staffing",
+        roles: ["Captain", "First Officer", "Lead Attendant"] as CrewMember["role"][],
+        detail: "The prediction is high risk. Select a relief flight deck pair and lead cabin crew.",
+      };
+    }
+    if (delay >= 15) {
+      return {
+        label: "Manual crew review",
+        roles: ["First Officer", "Lead Attendant"] as CrewMember["role"][],
+        detail: "The prediction requires review. Select available relief crew before dispatch.",
+      };
+    }
+    return {
+      label: "Monitor current crew",
+      roles: [] as CrewMember["role"][],
+      detail: "The predicted delay is below the crew intervention threshold.",
+    };
+  }
+
+  const predictedDelay = Number(
+    prediction?.response?.prediction?.predicted_arrival_delay_minutes ??
+      prediction?.prediction?.predicted_arrival_delay_minutes ??
+      0,
+  );
+  const staffingRecommendation = recommendationForDelay(predictedDelay);
 
   useEffect(() => {
-    fetch("http://localhost:8000/api/crew")
-      .then((response) => response.json())
-      .then((members) => {
+    try {
+      const stored = localStorage.getItem("flitzz:lastPrediction");
+      if (stored) {
+        const parsed = JSON.parse(stored) as PredictionContext;
+        setPrediction(parsed);
+        const flight = parsed.response?.flight ?? parsed.flight;
+        if (flight?.flight_id) setCrewFlightId(String(flight.flight_id));
+      }
+    } catch {
+      toast.error("Unable to read the latest prediction.");
+    }
+  }, []);
+
+  useEffect(() => {
+    async function loadCrew() {
+      setLoadingCrew(true);
+      try {
+        const flightId = Number(crewFlightId);
+        const [crewResponse, assignmentResponse] = await Promise.all([
+          fetch(`${apiUrl}/api/crew`),
+          Number.isInteger(flightId) && flightId > 0
+            ? fetch(`${apiUrl}/api/crew-assignments/${flightId}`)
+            : Promise.resolve(null),
+        ]);
+
+        if (!crewResponse.ok) {
+          const detail = await crewResponse.text();
+          throw new Error(
+            detail || `Crew API returned HTTP ${crewResponse.status}.`,
+          );
+        }
+
+        const members = await crewResponse.json();
+        const assignments =
+          assignmentResponse?.ok
+            ? ((await assignmentResponse.json()) as Assignment[])
+            : [];
+        const assignedByCrew = new Map(assignments.map((assignment) => [assignment.crew_id, assignment]));
         setCrewList(
           (members as Array<Record<string, unknown>>).map((member) => ({
             id: String(member.crew_id),
@@ -164,41 +215,62 @@ export function OpsManagerPage() {
               : member.role === "FIRST_OFFICER"
                 ? "First Officer"
                 : "Cabin Crew",
-            flightNo: "Available",
+            flightNo: assignedByCrew.has(Number(member.crew_id)) ? `Flight ${flightId}` : "Available",
             dutyRemaining: "Available",
-            status: member.status === "ACTIVE" ? "Standby" : "Off Duty",
+            status: assignedByCrew.has(Number(member.crew_id)) ? "Assigned" : member.status === "ACTIVE" ? "Standby" : "Off Duty",
+            selected: assignedByCrew.has(Number(member.crew_id)),
+            assignmentId: assignedByCrew.get(Number(member.crew_id))?.assignment_id,
           })),
         );
-      })
-      .catch(() => toast.error("Unable to load crew members from PostgreSQL."));
-  }, []);
+      } catch {
+        toast.error("Unable to load crew members from PostgreSQL.");
+      } finally {
+        setLoadingCrew(false);
+      }
+    }
+    void loadCrew();
+  }, [apiUrl, crewFlightId]);
 
-  async function assignCrewMember(crew: CrewMember) {
+  function toggleCrewSelection(crewId: string) {
+    setCrewList((current) => current.map((member) =>
+      member.id === crewId ? { ...member, selected: !member.selected } : member,
+    ));
+  }
+
+  async function saveCrewAssignments() {
     const flightId = Number(crewFlightId);
-    if (!crew.crewId || !Number.isInteger(flightId) || flightId <= 0) {
+    const selected = crewList.filter((crew) => crew.selected && crew.crewId);
+    if (!Number.isInteger(flightId) || flightId <= 0) {
       toast.error("Enter a valid flight ID before assigning crew.");
       return;
     }
-
-    const response = await fetch("http://localhost:8000/api/crew-assignments", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        flight_id: flightId,
-        assignments: [{ crew_id: crew.crewId, assignment_role: crew.role }],
-      }),
-    });
-
-    const body = await response.json();
-    if (!response.ok) {
-      toast.error(body.detail || "Crew assignment failed.");
+    if (selected.length === 0) {
+      toast.error("Select at least one crew member.");
       return;
     }
 
-    setCrewList((current) => current.map((member) =>
-      member.id === crew.id ? { ...member, flightNo: `Flight ${flightId}`, status: "Assigned" } : member,
-    ));
-    toast.success(`${crew.name} assigned to flight ${flightId}.`);
+    setSavingAssignments(true);
+    try {
+      const response = await fetch(`${apiUrl}/api/crew-assignments`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          flight_id: flightId,
+          notes: prediction?.response?.action?.message ?? "Prediction-driven crew assignment",
+          assignments: selected.map((crew) => ({ crew_id: crew.crewId, assignment_role: crew.role })),
+        }),
+      });
+      const body = await response.json();
+      if (!response.ok) throw new Error(body.detail || "Crew assignment failed.");
+      setCrewList((current) => current.map((member) =>
+        member.selected ? { ...member, flightNo: `Flight ${flightId}`, status: "Assigned" } : member,
+      ));
+      toast.success(`${selected.length} crew assignment(s) saved to PostgreSQL.`);
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : "Crew assignment failed.");
+    } finally {
+      setSavingAssignments(false);
+    }
   }
 
   function handleCrewSwap(targetId: string) {
@@ -337,23 +409,75 @@ export function OpsManagerPage() {
                   className="w-24 rounded-full border border-input bg-background/60 px-3 py-1.5 text-xs outline-none"
                 />
                 <span className="rounded-full bg-primary/10 px-3 py-1 text-xs font-semibold text-primary">
-                  {crewList.length} Available
+                  {crewList.filter((crew) => crew.status === "Standby").length} Available
                 </span>
               </div>
             </div>
 
+            <div className="mt-4 rounded-2xl border border-primary/20 bg-primary/5 p-4">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div>
+                  <p className="text-xs font-bold uppercase tracking-wider text-primary">
+                    Prediction-driven staffing
+                  </p>
+                  <p className="mt-1 text-lg font-black">
+                    {prediction ? `${predictedDelay.toFixed(0)} min predicted delay` : "No prediction loaded"}
+                  </p>
+                  <p className="mt-1 text-xs leading-5 text-muted-foreground">
+                    {staffingRecommendation.detail}
+                  </p>
+                </div>
+                <span className="rounded-full bg-background/70 px-3 py-1.5 text-xs font-semibold text-primary">
+                  {staffingRecommendation.label}
+                </span>
+              </div>
+              {staffingRecommendation.roles.length > 0 && (
+                <p className="mt-3 text-xs text-muted-foreground">
+                  Suggested roles: {staffingRecommendation.roles.join(" · ")}
+                </p>
+              )}
+            </div>
+
+            <div className="mt-4 flex items-center justify-between gap-3">
+              <p className="text-xs text-muted-foreground">
+                {loadingCrew ? "Loading crew from PostgreSQL..." : "Select crew members to assign to this flight."}
+              </p>
+              <button
+                onClick={saveCrewAssignments}
+                disabled={savingAssignments || loadingCrew}
+                className="bg-brand inline-flex items-center gap-2 rounded-full px-4 py-2 text-xs font-semibold text-primary-foreground shadow-glow disabled:opacity-50"
+              >
+                {savingAssignments && <RefreshCw className="h-3.5 w-3.5 animate-spin" />}
+                Save assignments
+              </button>
+            </div>
+
             <div className="mt-5 grid gap-3">
-              {crewList.map((crew) => (
+              {crewList.length === 0 && !loadingCrew ? (
+                <div className="rounded-2xl border border-dashed border-border p-5 text-sm text-muted-foreground">
+                  No active crew members were returned by the database.
+                </div>
+              ) : crewList.map((crew) => (
                 <div
                   key={crew.id}
                   className={`rounded-2xl border p-4 transition-all ${
-                    crew.dutyLimitWarning
+                    crew.selected
+                      ? "border-primary bg-primary/5"
+                      : crew.dutyLimitWarning
                       ? "border-amber-500/50 bg-amber-500/10"
                       : "border-border bg-background/50"
                   }`}
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2">
-                    <div>
+                    <label className="flex items-start gap-3">
+                      <input
+                        type="checkbox"
+                        checked={crew.selected ?? false}
+                        onChange={() => toggleCrewSelection(crew.id)}
+                        disabled={crew.status === "Off Duty"}
+                        className="mt-1 h-4 w-4 accent-primary"
+                      />
+                      <div>
                       <div className="flex items-center gap-2">
                         <h4 className="font-bold text-foreground">{crew.name}</h4>
                         <span className="rounded-md bg-accent px-2 py-0.5 text-xs font-medium text-muted-foreground">
@@ -373,15 +497,12 @@ export function OpsManagerPage() {
                           {crew.dutyRemaining}
                         </strong>
                       </p>
-                    </div>
-
-                    {crew.status !== "Off Duty" && (
-                      <button
-                        onClick={() => assignCrewMember(crew)}
-                        className="bg-brand rounded-full px-4 py-1.5 text-xs font-semibold text-primary-foreground shadow-glow transition-transform duration-300 hover:scale-[1.03]"
-                      >
-                        Assign to flight
-                      </button>
+                      </div>
+                    </label>
+                    {staffingRecommendation.roles.includes(crew.role) && crew.status !== "Off Duty" && (
+                      <span className="rounded-full border border-primary/20 px-3 py-1 text-[10px] font-bold uppercase tracking-wider text-primary">
+                        Suggested
+                      </span>
                     )}
                   </div>
                 </div>

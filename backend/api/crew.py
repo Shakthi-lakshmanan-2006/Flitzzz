@@ -92,6 +92,16 @@ def assign_crew(
     result = []
 
     with engine.begin() as conn:
+        conn.execute(
+            text(
+                """
+                DELETE FROM crew_assignments
+                WHERE flight_id = :flight_id
+                """
+            ),
+            {"flight_id": request.flight_id},
+        )
+
         for assignment in request.assignments:
             row = conn.execute(
                 text(
@@ -132,3 +142,43 @@ def assign_crew(
             })
 
     return result
+
+
+# =========================================================
+# GET FLIGHT ASSIGNMENTS
+# =========================================================
+
+@router.get(
+    "/crew-assignments/{flight_id}",
+    response_model=list[CrewAssignmentResponse]
+)
+def get_flight_assignments(flight_id: int):
+
+    query = """
+        SELECT
+            ca.assignment_id,
+            ca.flight_id,
+            ca.crew_member_id AS crew_id,
+            CONCAT(cm.first_name, ' ', cm.last_name) AS crew_name,
+            ca.assignment_role,
+            ca.assigned_at
+        FROM crew_assignments ca
+        JOIN crew_members cm
+          ON cm.crew_member_id = ca.crew_member_id
+        WHERE ca.flight_id = :flight_id
+        ORDER BY ca.assigned_at, ca.assignment_id
+    """
+
+    with engine.connect() as conn:
+        rows = conn.execute(
+            text(query),
+            {"flight_id": flight_id},
+        ).mappings().all()
+
+    return [
+        {
+            **dict(row),
+            "assigned_at": row["assigned_at"].isoformat(),
+        }
+        for row in rows
+    ]
