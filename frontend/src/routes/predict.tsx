@@ -358,6 +358,28 @@ const EXPECTED_LGB_FEATURES_FALLBACK = [
   "ROUTE_HIST_DELAY",
 ];
 
+function persistRebookingContext(
+  response: BackendPredictionResponse,
+  decision: OperationalDecision,
+) {
+  const context = {
+    decision,
+    flight: response.flight,
+    prediction: response.prediction,
+    reasons: response.reasons,
+    response,
+    createdAt: new Date().toISOString(),
+  };
+
+  try {
+    const serialized = JSON.stringify(context);
+    localStorage.setItem("flitzz:pendingAction", serialized);
+    sessionStorage.setItem("flitzz_prediction", serialized);
+  } catch {
+    // Navigation can continue even when browser storage is unavailable.
+  }
+}
+
 /* ============================================================
    MODEL RESULT HELPERS
    ============================================================ */
@@ -1161,20 +1183,6 @@ type OperationalDecision =
   | "MANUAL_ACTION"
   | "AUTOMATIC_ACTION";
 
-function decisionFromBackend(
-  value: string,
-): OperationalDecision {
-  if (value === "AUTOMATIC_ACTION") {
-    return "AUTOMATIC_ACTION";
-  }
-
-  if (value === "MANUAL_ACTION") {
-    return "MANUAL_ACTION";
-  }
-
-  return "NORMAL_WAIT";
-}
-
 function DecisionBadge({
   decision,
 }: {
@@ -1274,7 +1282,7 @@ function Predict() {
 
     try {
       const payload = {
-        flight_id: Number(id),
+        flight_key: id,
       };
 
       const response =
@@ -1313,12 +1321,24 @@ function Predict() {
         const detail =
           (
             data as unknown as {
-              detail?: string;
+              detail?: string | {
+                loc?: unknown[];
+                msg?: string;
+              }[];
             }
           )?.detail;
 
+        const message =
+          typeof detail === "string"
+            ? detail
+            : Array.isArray(detail)
+              ? detail
+                  .map((item) => item.msg || "Validation error")
+                  .join("; ")
+              : undefined;
+
         throw new Error(
-          detail ||
+          message ||
             `Prediction failed with HTTP ${response.status}.`,
         );
       }
@@ -1414,13 +1434,6 @@ function Predict() {
   const prediction =
     backendResponse?.prediction;
 
-  const decision =
-    backendResponse
-      ? decisionFromBackend(
-          backendResponse.decision,
-        )
-      : "NORMAL_WAIT";
-
   const predictedDelay =
     prediction
       ? Number(
@@ -1428,11 +1441,26 @@ function Predict() {
         )
       : null;
 
-  const shouldShowAction =
-    Boolean(
-      backendResponse?.action
-        ?.requires_trigger,
-    );
+  /* ==========================================================
+     OPERATIONAL ACTION RULES
+
+     < 15 min   → NORMAL
+     15–29.99   → MANUAL ACTION
+     >= 30 min  → AUTOMATIC ACTION
+  ========================================================== */
+  const decision: OperationalDecision =
+    predictedDelay === null || !Number.isFinite(predictedDelay)
+      ? "NORMAL_WAIT"
+      : predictedDelay < 15
+        ? "NORMAL_WAIT"
+        : predictedDelay < 30
+          ? "MANUAL_ACTION"
+          : "AUTOMATIC_ACTION";
+
+  const requiresRebook =
+    predictedDelay !== null &&
+    Number.isFinite(predictedDelay) &&
+    predictedDelay >= 15;
 
 
   /* ============================================================
@@ -1610,8 +1638,7 @@ function Predict() {
       ====================================================== */}
 
       {backendResponse && (
-        <Reveal delay={120}>
-          <div className="mt-6">
+        <div className="mt-6">
             <GlassCard>
 
               <div className="mb-6 flex flex-wrap items-start justify-between gap-4 border-b border-border/60 pb-5">
@@ -1636,9 +1663,23 @@ function Predict() {
                   </p>
                 </div>
 
-                <DecisionBadge
-                  decision={decision}
-                />
+                {requiresRebook && (
+                  <a
+                    href={`/rebook?flight_id=${backendResponse.flight.flight_id}`}
+                    onClick={() =>
+                      persistRebookingContext(
+                        backendResponse,
+                        decision,
+                      )
+                    }
+                    className="inline-flex shrink-0 items-center justify-center gap-2 rounded-full bg-brand px-5 py-3 text-sm font-extrabold text-primary-foreground shadow-glow transition-transform hover:scale-[1.02]"
+                  >
+                    {decision === "AUTOMATIC_ACTION"
+                      ? "Rebook Flight"
+                      : "Review & Rebook"}
+                    <ArrowRight className="h-4 w-4" />
+                  </a>
+                )}
               </div>
 
 
@@ -1727,133 +1768,110 @@ function Predict() {
                     </div>
 
 
-                    {/* OPERATIONAL DECISION */}
+                    {/* ==================================================
+                        OPERATIONAL ACTION
 
+                        One decision + one action button.
+                        The action is driven directly by the LightGBM
+                        predicted arrival delay.
+                    ================================================== */}
                     <div
-                      className={`
-                        rounded-2xl border p-5
-                        ${
-                          decision ===
-                          "AUTOMATIC_ACTION"
-                            ? "border-destructive/40 bg-destructive/10"
-                            : decision ===
-                              "MANUAL_ACTION"
-                              ? "border-amber-400/30 bg-amber-400/10"
-                              : "border-emerald-400/30 bg-emerald-400/10"
-                        }
-                      `}
+                      className={`rounded-3xl border p-6 ${
+                        decision === "AUTOMATIC_ACTION"
+                          ? "border-destructive/40 bg-destructive/10"
+                          : decision === "MANUAL_ACTION"
+                            ? "border-amber-400/30 bg-amber-400/10"
+                            : "border-emerald-400/30 bg-emerald-400/10"
+                      }`}
                     >
-
-                      <div className="flex items-start gap-4">
-
-                        {decision ===
-                        "NORMAL_WAIT" ? (
-                          <CheckCircle2 className="mt-0.5 h-6 w-6 shrink-0 text-emerald-400" />
-                        ) : decision ===
-                          "MANUAL_ACTION" ? (
-                          <Clock3 className="mt-0.5 h-6 w-6 shrink-0 text-amber-400" />
-                        ) : (
-                          <AlertTriangle className="mt-0.5 h-6 w-6 shrink-0 text-destructive" />
-                        )}
-
-                        <div>
-
-                          <p className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                            Operational decision
-                          </p>
-
-                          <h3 className="mt-1 text-xl font-bold">
-                            {decision ===
-                            "AUTOMATIC_ACTION"
-                              ? "AUTOMATIC ACTION"
-                              : decision ===
-                                "MANUAL_ACTION"
-                                ? "MANUAL ACTION REQUIRED"
-                                : "NORMAL — CONTINUE MONITORING"}
-                          </h3>
-
-                          <p className="mt-2 text-sm text-muted-foreground">
-                            {
-                              backendResponse.action
-                                .message
-                            }
-                          </p>
-
-                        </div>
-
-                      </div>
-
-                    </div>
-
-
-                    {/* ACTION TRIGGER */}
-
-                    {shouldShowAction && (
-                      <div className="rounded-2xl border border-primary/40 bg-primary/5 p-5">
-
-                        <div className="flex flex-wrap items-center justify-between gap-4">
-
-                          <div>
-
-                            <p className="text-xs font-semibold uppercase tracking-wider text-primary">
-                              Action trigger
+                      <div className="flex flex-wrap items-start justify-between gap-5">
+                        <div className="min-w-0">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <p className="text-xs font-extrabold uppercase tracking-[0.16em] text-primary">
+                              Operational action
                             </p>
-
-                            <h3 className="mt-1 text-lg font-bold">
-                              {decision ===
-                              "AUTOMATIC_ACTION"
-                                ? "Trigger automatic response"
-                                : "Send for manual operations review"}
-                            </h3>
-
-                            <p className="mt-1 text-sm text-muted-foreground">
-                              This button is shown only
-                              when the predicted delay
-                              reaches the operational
-                              action threshold.
-                            </p>
-
+                            <DecisionBadge decision={decision} />
                           </div>
 
-                          <Link
-                            to="/ops"
-                            onClick={() => {
-                              try {
-                                localStorage.setItem(
-                                  "flitzz:pendingAction",
-                                  JSON.stringify({
-                                    decision,
-                                    flight:
-                                      backendResponse.flight,
-                                    prediction:
-                                      backendResponse.prediction,
-                                    reasons:
-                                      backendResponse.reasons,
-                                    response:
-                                      backendResponse,
-                                    createdAt:
-                                      new Date().toISOString(),
-                                  }),
-                                );
-                              } catch {
-                                // Navigation can continue.
-                              }
-                            }}
-                            className="inline-flex items-center justify-center gap-2 rounded-full bg-brand px-5 py-2.5 text-sm font-semibold text-primary-foreground shadow-glow transition-transform hover:scale-[1.02]"
-                          >
-                            {decision ===
-                            "AUTOMATIC_ACTION"
-                              ? "Trigger action"
-                              : "Review action"}
+                          <h3 className="mt-3 text-xl font-extrabold">
+                            {decision === "AUTOMATIC_ACTION"
+                              ? "Automatic rebooking recommended"
+                              : decision === "MANUAL_ACTION"
+                                ? "Manual rebooking review required"
+                                : "No rebooking action required"}
+                          </h3>
 
-                            <ArrowRight className="h-4 w-4" />
-                          </Link>
-
+                          <p className="mt-2 max-w-2xl text-sm leading-6 text-muted-foreground">
+                            LightGBM predicts an expected arrival delay of{" "}
+                            <strong className="font-extrabold text-foreground">
+                              {predictedDelay !== null
+                                ? `${minuteText(predictedDelay)} min`
+                                : "—"}
+                            </strong>.{" "}
+                            {decision === "AUTOMATIC_ACTION"
+                              ? "The prediction is at or above the 30-minute automation threshold."
+                              : decision === "MANUAL_ACTION"
+                                ? "The prediction is between 15 and 30 minutes, so an operations review is required before rebooking."
+                                : "The prediction is below the 15-minute intervention threshold, so the flight can continue under normal monitoring."}
+                          </p>
                         </div>
 
+                        {requiresRebook && (
+                          <a
+                            href={`/rebook?flight_id=${backendResponse.flight.flight_id}`}
+                            onClick={() =>
+                              persistRebookingContext(
+                                backendResponse,
+                                decision,
+                              )
+                            }
+                            className="inline-flex shrink-0 items-center justify-center gap-2 rounded-full bg-brand px-5 py-3 text-sm font-extrabold text-primary-foreground shadow-glow transition-transform hover:scale-[1.02]"
+                          >
+                            {decision === "AUTOMATIC_ACTION"
+                              ? "Rebook Flight"
+                              : "Review & Rebook"}
+                            <ArrowRight className="h-4 w-4" />
+                          </a>
+                        )}
                       </div>
-                    )}
 
+                      <div className="mt-5 grid gap-3 sm:grid-cols-3">
+                        <div className="rounded-2xl border border-border/60 bg-background/20 p-4">
+                          <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                            Decision threshold
+                          </p>
+                          <p className="mt-2 text-sm font-extrabold">
+                            {decision === "AUTOMATIC_ACTION"
+                              ? "≥ 30 min"
+                              : decision === "MANUAL_ACTION"
+                                ? "15–29.99 min"
+                                : "< 15 min"}
+                          </p>
+                        </div>
+
+                        <div className="rounded-2xl border border-border/60 bg-background/20 p-4">
+                          <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                            Automation policy
+                          </p>
+                          <p className="mt-2 text-sm font-extrabold">
+                            {decision === "AUTOMATIC_ACTION"
+                              ? "Automatic intervention"
+                              : decision === "MANUAL_ACTION"
+                                ? "Human review"
+                                : "Continue monitoring"}
+                          </p>
+                        </div>
+
+                        <div className="rounded-2xl border border-border/60 bg-background/20 p-4">
+                          <p className="text-[10px] font-bold uppercase tracking-wider text-muted-foreground">
+                            Decision source
+                          </p>
+                          <p className="mt-2 text-sm font-extrabold">
+                            LightGBM predicted delay
+                          </p>
+                        </div>
+                      </div>
+                    </div>
 
                     {/* ACTUAL DB OUTCOME */}
 
@@ -1949,8 +1967,7 @@ function Predict() {
                 )}
 
             </GlassCard>
-          </div>
-        </Reveal>
+        </div>
       )}
     </PageShell>
   );

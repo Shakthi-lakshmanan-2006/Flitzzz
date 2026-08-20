@@ -36,4 +36,4 @@ class NotificationResponse(BaseModel):
 
     sent_at: Optional[str] = None
 
-    message: str
+    message: str        

@@ -1,327 +1,182 @@
 from fastapi import APIRouter, HTTPException
+from sqlalchemy import text
 
-from database import get_connection
-
-from schemas.flight import (
-    PassengerFlightResponse,
-    FlightResponse,
-    AffectedPassengerResponse
-)
-
-from schemas.prediction import (
-    PredictionRequest,
-    PredictionResponse,
-    DelayCauseResponse
-)
-
-from services.prediction import (
-    run_prediction,
-    get_dummy_why_delay
-)
+from database import engine
 
 
 router = APIRouter(
-    prefix="/api",
-    tags=["Flights"]
+    prefix="/api/flights",
+    tags=["Flights"],
 )
 
 
-# =========================================================
-# PASSENGER FLIGHTS
-# =========================================================
+@router.get("")
+def list_flights(limit: int = 200):
+    limit = max(1, min(limit, 1000))
 
-@router.get(
-    "/passenger-flights",
-    response_model=list[PassengerFlightResponse]
-)
-def get_passenger_flights():
-
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    try:
-
-        cursor.execute("""
-            SELECT
-
-                p.passenger_id,
-                p.passenger_code,
-
-                p.first_name || ' ' || p.last_name
-                    AS passenger_name,
-
-                p.age,
-                p.gender,
-                p.email,
-
-                b.booking_id,
-                b.booking_reference,
-                b.cabin_class,
-                b.seat_number,
-                b.ticket_price,
-
-                f.flight_id,
-                f.flight_number,
-                f.route,
-                f.flight_date,
-
-                f.scheduled_departure,
-                f.scheduled_arrival,
-
-                fp.delay_probability,
-                fp.expected_delay_minutes,
-                fp.risk_level
-
-            FROM passengers p
-
-            JOIN bookings b
-                ON b.passenger_id = p.passenger_id
-
-            JOIN flights f
-                ON f.flight_id = b.flight_id
-
-            LEFT JOIN LATERAL (
-
+    with engine.connect() as conn:
+        summary = conn.execute(
+            text(
+                """
                 SELECT
-                    delay_probability,
-                    expected_delay_minutes,
-                    risk_level
-
-                FROM flight_predictions
-
-                WHERE flight_id = f.flight_id
-
-                ORDER BY prediction_timestamp DESC
-
-                LIMIT 1
-
-            ) fp ON TRUE
-
-            WHERE p.passenger_code LIKE 'PAX%'
-
-            ORDER BY p.passenger_id;
-        """)
-
-        rows = cursor.fetchall()
-
-        return rows
-
-    finally:
-
-        cursor.close()
-        conn.close()
-
-
-# =========================================================
-# FLIGHT DETAILS
-# =========================================================
-
-@router.get(
-    "/flights/{flight_id}",
-    response_model=FlightResponse
-)
-def get_flight(flight_id: int):
-
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    try:
-
-        cursor.execute("""
-            SELECT
-
-                flight_id,
-                flight_number,
-                airline_id,
-                aircraft_id,
-                origin_airport_id,
-                destination_airport_id,
-                route,
-                flight_date,
-                scheduled_departure,
-                scheduled_arrival,
-                scheduled_time_minutes,
-                distance,
-                cancelled,
-                diverted
-
-            FROM flights
-
-            WHERE flight_id = %s
-        """, (flight_id,))
-
-        flight = cursor.fetchone()
-
-        if not flight:
-
-            raise HTTPException(
-                status_code=404,
-                detail="Flight not found"
+                    COUNT(*) AS total_flights,
+                    COUNT(DISTINCT al.airline_id) AS total_airlines,
+                    COUNT(DISTINCT oa.airport_id) AS origin_airports,
+                    COUNT(DISTINCT da.airport_id) AS destination_airports
+                FROM flights f
+                LEFT JOIN airlines al ON al.airline_id = f.airline_id
+                LEFT JOIN airports oa ON oa.airport_id = f.origin_airport_id
+                LEFT JOIN airports da ON da.airport_id = f.destination_airport_id
+                """
             )
+        ).mappings().one()
 
-        return flight
-
-    finally:
-
-        cursor.close()
-        conn.close()
-
-
-# =========================================================
-# PREDICT
-# =========================================================
-
-@router.post(
-    "/flights/{flight_id}/predict",
-    response_model=PredictionResponse
-)
-def predict_flight(
-    flight_id: int,
-    request: PredictionRequest
-):
-
-    # TODO:
-    # Later replace dummy service with:
-    #
-    # feature_builder
-    # CatBoost
-    # LightGBM
-    # ensemble
-    # SHAP
-    # database insert
-
-    result = run_prediction(flight_id)
-
-    return result
-
-
-# =========================================================
-# LATEST PREDICTION
-# =========================================================
-
-@router.get(
-    "/flights/{flight_id}/prediction",
-    response_model=PredictionResponse
-)
-def latest_prediction(flight_id: int):
-
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    try:
-
-        cursor.execute("""
-            SELECT
-
-                prediction_id,
-                flight_id,
-                delay_probability,
-                expected_delay_minutes,
-                risk_level,
-                model_name,
-                model_version,
-                prediction_timestamp
-
-            FROM flight_predictions
-
-            WHERE flight_id = %s
-
-            ORDER BY prediction_timestamp DESC
-
-            LIMIT 1
-        """, (flight_id,))
-
-        prediction = cursor.fetchone()
-
-        if not prediction:
-
-            raise HTTPException(
-                status_code=404,
-                detail="No prediction available"
+        airline_counts = conn.execute(
+            text(
+                """
+                SELECT
+                    al.iata_code AS airline_code,
+                    al.airline_name,
+                    COUNT(*) AS flight_count
+                FROM flights f
+                LEFT JOIN airlines al ON al.airline_id = f.airline_id
+                GROUP BY al.iata_code, al.airline_name
+                ORDER BY flight_count DESC, al.airline_name
+                """
             )
+        ).mappings().all()
 
-        # flight number
-        cursor.execute("""
-            SELECT flight_number
-            FROM flights
-            WHERE flight_id = %s
-        """, (flight_id,))
+        airport_counts = conn.execute(
+            text(
+                """
+                SELECT airport_code, airport_name, airport_type, SUM(flight_count) AS flight_count
+                FROM (
+                    SELECT
+                        oa.iata_code AS airport_code,
+                        oa.airport_name,
+                        'Origin' AS airport_type,
+                        COUNT(*) AS flight_count
+                    FROM flights f
+                    LEFT JOIN airports oa ON oa.airport_id = f.origin_airport_id
+                    GROUP BY oa.iata_code, oa.airport_name
+                    UNION ALL
+                    SELECT
+                        da.iata_code AS airport_code,
+                        da.airport_name,
+                        'Destination' AS airport_type,
+                        COUNT(*) AS flight_count
+                    FROM flights f
+                    LEFT JOIN airports da ON da.airport_id = f.destination_airport_id
+                    GROUP BY da.iata_code, da.airport_name
+                ) airport_activity
+                GROUP BY airport_code, airport_name, airport_type
+                ORDER BY flight_count DESC, airport_name
+                """
+            )
+        ).mappings().all()
 
-        flight = cursor.fetchone()
+        rows = conn.execute(
+            text(
+                """
+                SELECT
+                    f.flight_id,
+                    f.flight_number,
+                    al.iata_code AS airline_code,
+                    al.airline_name,
+                    oa.iata_code AS origin_airport,
+                    da.iata_code AS destination_airport,
+                    f.scheduled_departure,
+                    f.scheduled_arrival,
+                    f.distance_miles,
+                    COALESCE(fd.departure_delay_minutes, 0) AS departure_delay_minutes,
+                    COALESCE(fd.arrival_delay_minutes, 0) AS arrival_delay_minutes,
+                    COALESCE(fd.delayed_15, FALSE) AS delayed_15
+                FROM flights f
+                LEFT JOIN airlines al ON al.airline_id = f.airline_id
+                LEFT JOIN airports oa ON oa.airport_id = f.origin_airport_id
+                LEFT JOIN airports da ON da.airport_id = f.destination_airport_id
+                LEFT JOIN flight_delay fd ON fd.flight_id = f.flight_id
+                ORDER BY f.flight_date DESC, f.flight_id DESC
+                LIMIT :limit
+                """
+            ),
+            {"limit": limit},
+        ).mappings().all()
 
-        prediction["flight_number"] = (
-            flight["flight_number"]
-            if flight else "UNKNOWN"
+    flights = []
+    for row in rows:
+        delay = float(row["arrival_delay_minutes"] or row["departure_delay_minutes"] or 0)
+        risk = "High" if delay >= 30 else "Medium" if delay >= 15 else "Low"
+        probability = 1 if row["delayed_15"] else max(0, min(delay / 30, 0.99))
+        flights.append(
+            {
+                **dict(row),
+                "probability": probability,
+                "risk_level": risk,
+            }
         )
 
-        return prediction
-
-    finally:
-
-        cursor.close()
-        conn.close()
-
-
-# =========================================================
-# WHY DELAY
-# =========================================================
-
-@router.get(
-    "/flights/{flight_id}/why-delay",
-    response_model=DelayCauseResponse
-)
-def why_delay(flight_id: int):
-
-    return get_dummy_why_delay(flight_id)
+    return {
+        "status": "success",
+        "summary": dict(summary),
+        "airline_counts": [dict(row) for row in airline_counts],
+        "airport_counts": [dict(row) for row in airport_counts],
+        "flights": flights,
+    }
 
 
-# =========================================================
-# AFFECTED PASSENGERS
-# =========================================================
+@router.get("/{flight_id}")
+def get_flight(flight_id: int):
 
-@router.get(
-    "/flights/{flight_id}/passengers",
-    response_model=list[AffectedPassengerResponse]
-)
-def affected_passengers(flight_id: int):
+    with engine.connect() as conn:
 
-    conn = get_connection()
-    cursor = conn.cursor()
+        flight = conn.execute(
+            text(
+                """
+                SELECT
+                    f.flight_id,
+                    f.flight_number,
+                    f.flight_date,
 
-    try:
+                    al.iata_code AS airline_code,
+                    al.airline_name,
 
-        cursor.execute("""
-            SELECT
+                    oa.iata_code AS origin_airport,
+                    oa.airport_name AS origin_name,
 
-                p.passenger_id,
-                p.passenger_code,
+                    da.iata_code AS destination_airport,
+                    da.airport_name AS destination_name,
 
-                p.first_name || ' ' || p.last_name
-                    AS passenger_name,
+                    f.scheduled_departure,
+                    f.scheduled_arrival
 
-                p.email,
+                FROM flights f
 
-                b.booking_id,
-                b.booking_reference,
+                LEFT JOIN airlines al
+                    ON al.airline_id = f.airline_id
 
-                b.cabin_class,
-                b.seat_number,
+                LEFT JOIN airports oa
+                    ON oa.airport_id = f.origin_airport_id
 
-                b.status AS booking_status
+                LEFT JOIN airports da
+                    ON da.airport_id = f.destination_airport_id
 
-            FROM passengers p
+                WHERE f.flight_id = :flight_id
+                """
+            ),
+            {
+                "flight_id": flight_id
+            },
+        ).mappings().first()
 
-            JOIN bookings b
-                ON b.passenger_id = p.passenger_id
+    if not flight:
 
-            WHERE b.flight_id = %s
+        raise HTTPException(
+            status_code=404,
+            detail="Flight not found."
+        )
 
-            ORDER BY p.passenger_id
-        """, (flight_id,))
-
-        return cursor.fetchall()
-
-    finally:
-
-        cursor.close()
-        conn.close()
+    return {
+        "status": "success",
+        "flight": dict(flight),
+    }

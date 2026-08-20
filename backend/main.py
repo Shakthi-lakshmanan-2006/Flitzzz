@@ -40,13 +40,6 @@ from typing import Any, Optional
 import joblib
 import xgboost as xgb
 import numpy as np
-
-try:
-    import shap
-    SHAP_AVAILABLE = True
-except ImportError:
-    shap = None
-    SHAP_AVAILABLE = False
 import pandas as pd
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -242,11 +235,11 @@ load_models()
 # ============================================================================
 
 class FlightLookupRequest(BaseModel):
-    flight_id: int = Field(
+    flight_key: str = Field(
         ...,
-        ge=1,
-        description="Unique flight ID from the flights table.",
-        examples=[123456],
+        min_length=1,
+        description="Database flight_id or flight_number.",
+        examples=["123456", "AA123"],
     )
 
 
@@ -279,95 +272,203 @@ def db_value(value: Any) -> Any:
     return value
 
 
-def get_flight_from_db(flight_id: int) -> dict[str, Any]:
-    """Resolve a flight using only its unique PostgreSQL flight_id."""
-    if int(flight_id) < 1:
-        raise HTTPException(status_code=400, detail="Enter a valid flight ID.")
+def get_flight_from_db(flight_key: str) -> dict[str, Any]:
+    """
+    Resolve either:
+      - numeric flight_id
+      - flight_number
 
-    query = text(
-        """
-        SELECT
-            f.flight_id,
-            f.source_row_id,
-            f.flight_number,
-            f.flight_date,
-            f.year,
-            f.month,
-            f.day,
-            f.day_of_week,
-            f.airline_id,
-            f.origin_airport_id,
-            f.destination_airport_id,
+    If a flight number appears multiple times, the most recent database
+    record is selected. The response tells the frontend how it was resolved.
+    """
 
-            al.iata_code AS airline_code,
-            al.airline_name,
+    key = flight_key.strip()
 
-            ac.tail_number,
+    if not key:
+        raise HTTPException(
+            status_code=400,
+            detail="Enter a flight ID or flight number.",
+        )
 
-            oa.iata_code AS origin_airport,
-            oa.airport_name AS origin_name,
-            oa.city AS origin_city,
+    numeric_id: Optional[int] = None
+    if key.isdigit():
+        try:
+            numeric_id = int(key)
+        except ValueError:
+            numeric_id = None
 
-            da.iata_code AS destination_airport,
-            da.airport_name AS destination_name,
-            da.city AS destination_city,
+    # The schema is the user's normalized PostgreSQL schema:
+    # flights -> airlines / aircraft / airports -> flight_delay.
+    if numeric_id is not None:
+        query = text(
+            """
+            SELECT
+                f.flight_id,
+                f.source_row_id,
+                f.flight_number,
+                f.flight_date,
+                f.year,
+                f.month,
+                f.day,
+                f.day_of_week,
+                f.airline_id,
+                f.origin_airport_id,
+                f.destination_airport_id,
 
-            f.scheduled_departure,
-            f.scheduled_arrival,
-            f.departure_time,
-            f.arrival_time,
+                al.iata_code AS airline_code,
+                al.airline_name,
 
-            f.scheduled_time_minutes,
-            f.elapsed_time_minutes,
-            f.air_time_minutes,
-            f.taxi_out_minutes,
-            f.taxi_in_minutes,
+                ac.tail_number,
 
-            f.wheels_off,
-            f.wheels_on,
+                oa.iata_code AS origin_airport,
+                oa.airport_name AS origin_name,
+                oa.city AS origin_city,
 
-            f.distance_miles,
-            f.diverted,
-            f.cancelled,
+                da.iata_code AS destination_airport,
+                da.airport_name AS destination_name,
+                da.city AS destination_city,
 
-            f.departure_hour,
-            f.departure_minute,
-            f.arrival_hour,
-            f.arrival_minute,
+                f.scheduled_departure,
+                f.scheduled_arrival,
+                f.departure_time,
+                f.arrival_time,
 
-            f.is_weekend,
-            f.season,
-            f.departure_period,
-            f.route,
-            f.flight_datetime,
+                f.scheduled_time_minutes,
+                f.elapsed_time_minutes,
+                f.air_time_minutes,
+                f.taxi_out_minutes,
+                f.taxi_in_minutes,
 
-            fd.departure_delay_minutes,
-            fd.arrival_delay_minutes,
-            fd.delayed_15,
-            fd.delay_status,
-            fd.delay_category
+                f.wheels_off,
+                f.wheels_on,
 
-        FROM flights f
-        JOIN airlines al
-            ON al.airline_id = f.airline_id
-        LEFT JOIN aircraft ac
-            ON ac.aircraft_id = f.aircraft_id
-        JOIN airports oa
-            ON oa.airport_id = f.origin_airport_id
-        JOIN airports da
-            ON da.airport_id = f.destination_airport_id
-        LEFT JOIN flight_delay fd
-            ON fd.flight_id = f.flight_id
+                f.distance_miles,
+                f.diverted,
+                f.cancelled,
 
-        WHERE f.flight_id = :flight_id
+                f.departure_hour,
+                f.departure_minute,
+                f.arrival_hour,
+                f.arrival_minute,
 
-        LIMIT 1
-        """
-    )
+                f.is_weekend,
+                f.season,
+                f.departure_period,
+                f.route,
+                f.flight_datetime,
 
-    params = {
-        "flight_id": int(flight_id),
-    }
+                fd.departure_delay_minutes,
+                fd.arrival_delay_minutes,
+                fd.delayed_15,
+                fd.delay_status,
+                fd.delay_category
+
+            FROM flights f
+            JOIN airlines al
+                ON al.airline_id = f.airline_id
+            LEFT JOIN aircraft ac
+                ON ac.aircraft_id = f.aircraft_id
+            JOIN airports oa
+                ON oa.airport_id = f.origin_airport_id
+            JOIN airports da
+                ON da.airport_id = f.destination_airport_id
+            LEFT JOIN flight_delay fd
+                ON fd.flight_id = f.flight_id
+
+            WHERE f.flight_id = :flight_id
+            LIMIT 1
+            """
+        )
+        params = {"flight_id": numeric_id}
+        resolution = "flight_id"
+
+    else:
+        query = text(
+            """
+            SELECT
+                f.flight_id,
+                f.source_row_id,
+                f.flight_number,
+                f.flight_date,
+                f.year,
+                f.month,
+                f.day,
+                f.day_of_week,
+                f.airline_id,
+                f.origin_airport_id,
+                f.destination_airport_id,
+
+                al.iata_code AS airline_code,
+                al.airline_name,
+
+                ac.tail_number,
+
+                oa.iata_code AS origin_airport,
+                oa.airport_name AS origin_name,
+                oa.city AS origin_city,
+
+                da.iata_code AS destination_airport,
+                da.airport_name AS destination_name,
+                da.city AS destination_city,
+
+                f.scheduled_departure,
+                f.scheduled_arrival,
+                f.departure_time,
+                f.arrival_time,
+
+                f.scheduled_time_minutes,
+                f.elapsed_time_minutes,
+                f.air_time_minutes,
+                f.taxi_out_minutes,
+                f.taxi_in_minutes,
+
+                f.wheels_off,
+                f.wheels_on,
+
+                f.distance_miles,
+                f.diverted,
+                f.cancelled,
+
+                f.departure_hour,
+                f.departure_minute,
+                f.arrival_hour,
+                f.arrival_minute,
+
+                f.is_weekend,
+                f.season,
+                f.departure_period,
+                f.route,
+                f.flight_datetime,
+
+                fd.departure_delay_minutes,
+                fd.arrival_delay_minutes,
+                fd.delayed_15,
+                fd.delay_status,
+                fd.delay_category
+
+            FROM flights f
+            JOIN airlines al
+                ON al.airline_id = f.airline_id
+            LEFT JOIN aircraft ac
+                ON ac.aircraft_id = f.aircraft_id
+            JOIN airports oa
+                ON oa.airport_id = f.origin_airport_id
+            JOIN airports da
+                ON da.airport_id = f.destination_airport_id
+            LEFT JOIN flight_delay fd
+                ON fd.flight_id = f.flight_id
+
+            WHERE UPPER(f.flight_number) = UPPER(:flight_number)
+
+            ORDER BY
+                f.flight_datetime DESC NULLS LAST,
+                f.flight_id DESC
+
+            LIMIT 1
+            """
+        )
+        params = {"flight_number": key}
+        resolution = "flight_number"
 
     with engine.connect() as conn:
         row = conn.execute(query, params).mappings().first()
@@ -375,12 +476,15 @@ def get_flight_from_db(flight_id: int) -> dict[str, Any]:
     if not row:
         raise HTTPException(
             status_code=404,
-            detail=f"No flight found with flight ID {int(flight_id)}.",
+            detail=(
+                f"No flight found for '{key}'. "
+                "Enter a valid database flight ID or flight number."
+            ),
         )
 
     data = {k: db_value(v) for k, v in row.items()}
-    data["_lookup_resolution"] = "flight_id"
-    data["_lookup_key"] = int(flight_id)
+    data["_lookup_resolution"] = resolution
+    data["_lookup_key"] = key
 
     return data
 
@@ -895,42 +999,31 @@ def _xgb_contributions(
     feature_columns: list[str],
 ) -> list[dict[str, Any]]:
     """
-    Per-flight SHAP explanation for the XGBoost delay classifier.
+    Per-flight XGBoost contribution using the trained booster.
 
-    Positive SHAP value -> pushes the prediction toward delayed_15=1.
-    Negative SHAP value -> pushes the prediction toward delayed_15=0.
+    Positive contribution => pushes the current prediction toward
+    delayed_15=1. Negative contribution => pushes it toward 0.
 
-    SHAP explains the model output; it is not a causal explanation.
+    This is an explanation of model output, not a causal claim.
     """
-    if not SHAP_AVAILABLE:
-        raise RuntimeError(
-            "SHAP is not installed. Run: pip install shap"
+    try:
+        booster = xgb_model.get_booster()
+        matrix = xgb.DMatrix(X)
+        contribution_matrix = booster.predict(
+            matrix,
+            pred_contribs=True,
         )
 
-    try:
-        explainer = shap.TreeExplainer(xgb_model)
-        explanation = explainer(X)
-
-        values = explanation.values
-
-        # SHAP versions/models can return:
-        #   (rows, features)
-        #   (rows, features, classes)
-        # For binary classification we explain class 1 (delayed).
-        if values.ndim == 3:
-            shap_values = values[0, :, 1]
-        else:
-            shap_values = values[0]
+        contributions = contribution_matrix[0][:-1]
 
         result = []
         for feature, contribution in zip(
             feature_columns,
-            shap_values,
+            contributions,
         ):
-            contribution = float(contribution)
             result.append({
                 "feature": feature,
-                "contribution": contribution,
+                "contribution": float(contribution),
                 "direction": (
                     "INCREASES_RISK"
                     if contribution > 0
@@ -948,7 +1041,7 @@ def _xgb_contributions(
 
     except Exception as exc:
         print(
-            "[WARNING] SHAP explanation unavailable:",
+            "[WARNING] Per-feature XGBoost contributions unavailable:",
             exc,
         )
         return []
@@ -1153,6 +1246,12 @@ def predict_lightgbm(model_features: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError(
             "LightGBM feature order changed unexpectedly."
         )
+
+    print()
+    print("[DEBUG] LIGHTGBM INPUT")
+    print("-" * 70)
+    print(df.to_string(index=False))
+    print("-" * 70)
 
     raw_prediction = float(
         lgb_model.predict(df)[0]
@@ -1467,7 +1566,9 @@ def predict(payload: FlightLookupRequest):
         # --------------------------------------------------------------------
         print("[1] Looking up flight in PostgreSQL...")
 
-        flight = get_flight_from_db(payload.flight_id)
+        flight = get_flight_from_db(
+            payload.flight_key
+        )
 
         print(
             f"[OK] Flight resolved: "
@@ -1635,7 +1736,7 @@ def predict(payload: FlightLookupRequest):
             "success": True,
 
             "lookup": {
-                "input": payload.flight_id,
+                "input": payload.flight_key,
                 "resolved_by": flight["_lookup_resolution"],
                 "resolved_value": flight["_lookup_key"],
             },
@@ -1799,7 +1900,6 @@ def health():
         "xgboost_loaded": xgb_model is not None,
         "lightgbm_loaded": lgb_model is not None,
         "lightgbm_features": len(lgb_features),
-        "shap_available": SHAP_AVAILABLE,
     }
 
 
@@ -1815,3 +1915,36 @@ def root():
         },
         "endpoint": "/predict",
     }
+
+# ============================================================================
+
+# ============================================================================
+# API ROUTERS
+# ============================================================================
+#
+# The ML prediction pipeline above is intentionally unchanged.
+# These routers add the operational APIs around it:
+#
+#   GET  /api/flights/{flight_id}
+#   GET  /api/rebooking/{flight_id}
+#   GET  /api/rebooking/{flight_id}/passengers
+#   GET  /api/rebooking/{flight_id}/alternatives
+#   POST /api/rebooking/{flight_id}/rebook
+#   POST /api/rebooking/recommendation/{recommendation_id}/accept
+#   POST /api/notifications/{flight_id}/send
+#
+# They use the existing files under backend/api and backend/services.
+# ============================================================================
+
+from api import (
+    flights_router,
+    rebooking_router,
+    notification_router,
+    crew_router,
+)
+
+
+app.include_router(flights_router)
+app.include_router(rebooking_router)
+app.include_router(notification_router)
+app.include_router(crew_router)

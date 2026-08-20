@@ -7,9 +7,7 @@ from typing import Optional
 # =========================================================
 
 class CrewResponse(BaseModel):
-
     crew_id: int
-
     crew_code: str
 
     first_name: str
@@ -64,7 +62,5 @@ class CrewAssignmentResponse(BaseModel):
     crew_name: str
 
     assignment_role: str
-
-    status: str
 
     assigned_at: str

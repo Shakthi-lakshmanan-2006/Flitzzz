@@ -16,7 +16,7 @@ import {
   Wrench,
   Zap,
 } from "lucide-react";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
 
 import { FlightIcon } from "@/components/flight-icon";
@@ -38,6 +38,7 @@ export const Route = createFileRoute("/ops")({
 
 type CrewMember = {
   id: string;
+  crewId?: number;
   name: string;
   role: "Captain" | "First Officer" | "Lead Attendant" | "Cabin Crew";
   flightNo: string;
@@ -147,6 +148,58 @@ export function OpsManagerPage() {
   const [crewList, setCrewList] = useState<CrewMember[]>(INITIAL_CREW);
   const [turnaroundList, setTurnaroundList] = useState<AircraftTurnaround[]>(INITIAL_TURNAROUND);
   const [dispatching, setDispatching] = useState(false);
+  const [crewFlightId, setCrewFlightId] = useState("");
+
+  useEffect(() => {
+    fetch("http://localhost:8000/api/crew")
+      .then((response) => response.json())
+      .then((members) => {
+        setCrewList(
+          (members as Array<Record<string, unknown>>).map((member) => ({
+            id: String(member.crew_id),
+            crewId: Number(member.crew_id),
+            name: `${member.first_name} ${member.last_name}`,
+            role: member.role === "CAPTAIN"
+              ? "Captain"
+              : member.role === "FIRST_OFFICER"
+                ? "First Officer"
+                : "Cabin Crew",
+            flightNo: "Available",
+            dutyRemaining: "Available",
+            status: member.status === "ACTIVE" ? "Standby" : "Off Duty",
+          })),
+        );
+      })
+      .catch(() => toast.error("Unable to load crew members from PostgreSQL."));
+  }, []);
+
+  async function assignCrewMember(crew: CrewMember) {
+    const flightId = Number(crewFlightId);
+    if (!crew.crewId || !Number.isInteger(flightId) || flightId <= 0) {
+      toast.error("Enter a valid flight ID before assigning crew.");
+      return;
+    }
+
+    const response = await fetch("http://localhost:8000/api/crew-assignments", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        flight_id: flightId,
+        assignments: [{ crew_id: crew.crewId, assignment_role: crew.role }],
+      }),
+    });
+
+    const body = await response.json();
+    if (!response.ok) {
+      toast.error(body.detail || "Crew assignment failed.");
+      return;
+    }
+
+    setCrewList((current) => current.map((member) =>
+      member.id === crew.id ? { ...member, flightNo: `Flight ${flightId}`, status: "Assigned" } : member,
+    ));
+    toast.success(`${crew.name} assigned to flight ${flightId}.`);
+  }
 
   function handleCrewSwap(targetId: string) {
     setCrewList((prev) =>
@@ -276,9 +329,17 @@ export function OpsManagerPage() {
                 </span>
                 <h3 className="text-xl font-bold">Crew Duty & Flight Assignments</h3>
               </div>
-              <span className="rounded-full bg-primary/10 px-3 py-1 text-xs font-semibold text-primary">
-                14 Standby Officers
-              </span>
+              <div className="flex items-center gap-2">
+                <input
+                  value={crewFlightId}
+                  onChange={(event) => setCrewFlightId(event.target.value.replace(/\D/g, ""))}
+                  placeholder="Flight ID"
+                  className="w-24 rounded-full border border-input bg-background/60 px-3 py-1.5 text-xs outline-none"
+                />
+                <span className="rounded-full bg-primary/10 px-3 py-1 text-xs font-semibold text-primary">
+                  {crewList.length} Available
+                </span>
+              </div>
             </div>
 
             <div className="mt-5 grid gap-3">
@@ -314,12 +375,12 @@ export function OpsManagerPage() {
                       </p>
                     </div>
 
-                    {crew.dutyLimitWarning && (
+                    {crew.status !== "Off Duty" && (
                       <button
-                        onClick={() => handleCrewSwap(crew.id)}
+                        onClick={() => assignCrewMember(crew)}
                         className="bg-brand rounded-full px-4 py-1.5 text-xs font-semibold text-primary-foreground shadow-glow transition-transform duration-300 hover:scale-[1.03]"
                       >
-                        Swap Standby Crew
+                        Assign to flight
                       </button>
                     )}
                   </div>

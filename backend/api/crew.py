@@ -1,7 +1,9 @@
 from fastapi import APIRouter
 from typing import Optional
 
-from database import get_connection
+from sqlalchemy import text
+
+from database import engine
 
 from schemas.crew import (
     CrewResponse,
@@ -30,16 +32,11 @@ def get_crew(
     status: str = "ACTIVE"
 ):
 
-    conn = get_connection()
-    cursor = conn.cursor()
-
-    try:
-
-        query = """
+    query = """
             SELECT
 
-                crew_id,
-                crew_code,
+                crew_member_id AS crew_id,
+                employee_code AS crew_code,
                 first_name,
                 last_name,
                 crew_type,
@@ -49,42 +46,35 @@ def get_crew(
 
             FROM crew_members
 
-            WHERE status = %s
+            WHERE status = :status
         """
 
-        params = [status]
+    params = {"status": status}
 
-        if crew_type:
-
-            query += """
-                AND crew_type = %s
-            """
-
-            params.append(crew_type)
-
-        if role:
-
-            query += """
-                AND role = %s
-            """
-
-            params.append(role)
+    if crew_type:
 
         query += """
-            ORDER BY crew_id
+            AND crew_type = :crew_type
         """
 
-        cursor.execute(
-            query,
-            tuple(params)
-        )
+        params["crew_type"] = crew_type
 
-        return cursor.fetchall()
+    if role:
 
-    finally:
+        query += """
+            AND role = :role
+        """
 
-        cursor.close()
-        conn.close()
+        params["role"] = role
+
+    query += """
+        ORDER BY crew_id
+    """
+
+    with engine.connect() as conn:
+        rows = conn.execute(text(query), params).mappings().all()
+
+    return [dict(row) for row in rows]
 
 
 # =========================================================
@@ -99,45 +89,46 @@ def assign_crew(
     request: CrewAssignmentRequest
 ):
 
-    # =====================================================
-    # DUMMY IMPLEMENTATION
-    # =====================================================
-    #
-    # Later:
-    #
-    # validate flight
-    # validate crew
-    # check availability
-    # check role
-    # check duplicate assignment
-    # INSERT into crew_assignments
-    #
-    # =====================================================
-
     result = []
 
-    for index, assignment in enumerate(
-        request.assignments,
-        start=1
-    ):
+    with engine.begin() as conn:
+        for assignment in request.assignments:
+            row = conn.execute(
+                text(
+                    """
+                    INSERT INTO crew_assignments
+                        (flight_id, crew_member_id, assignment_role)
+                    VALUES
+                        (:flight_id, :crew_member_id, :assignment_role)
+                    RETURNING assignment_id, flight_id, crew_member_id,
+                              assignment_role, assigned_at
+                    """
+                ),
+                {
+                    "flight_id": request.flight_id,
+                    "crew_member_id": assignment.crew_id,
+                    "assignment_role": assignment.assignment_role,
+                },
+            ).mappings().one()
 
-        result.append({
+            crew = conn.execute(
+                text(
+                    """
+                    SELECT first_name, last_name
+                    FROM crew_members
+                    WHERE crew_member_id = :crew_member_id
+                    """
+                ),
+                {"crew_member_id": assignment.crew_id},
+            ).mappings().one()
 
-            "assignment_id": index,
-
-            "flight_id": request.flight_id,
-
-            "crew_id": assignment.crew_id,
-
-            "crew_name": "Demo Crew",
-
-            "assignment_role":
-                assignment.assignment_role,
-
-            "status": "ASSIGNED",
-
-            "assigned_at":
-                "2026-08-16T20:00:00"
-        })
+            result.append({
+                "assignment_id": row["assignment_id"],
+                "flight_id": row["flight_id"],
+                "crew_id": row["crew_member_id"],
+                "crew_name": f"{crew['first_name']} {crew['last_name']}",
+                "assignment_role": row["assignment_role"],
+                "assigned_at": row["assigned_at"].isoformat(),
+            })
 
     return result
